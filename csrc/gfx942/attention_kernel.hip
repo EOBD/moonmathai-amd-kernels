@@ -19,26 +19,25 @@
 using namespace mmai_attention;
 namespace mmai_attention {
 
-
-template <bool kBSHD, bool isLite , bool Split >
+template <bool kBSHD, bool isLite, bool Split>
 __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *__restrict__ Q, const bf16_t *__restrict__ K,
                                                                   const bf16_t *__restrict__ V, // points to V_t (pre-transposed)
                                                                   bf16_t *__restrict__ Out, int seq_len, int seq_len_kv,
                                                                   float scale_log2e, // seq_len = Q rows; seq_len_kv = K/V rows (cross-attn)
                                                                   int heads,         // #heads — only needed for BSHD addressing (kBSHD)
                                                                   // ── LiteAttention skip (isLite only; dense passes the defaults) ──
-                                                                  const int16_t *__restrict__ read_list ,    // this phase's RLE keep-list (one row per CTA)
-                                                                  int16_t *__restrict__ write_list ,         // RLE keep-list emitted for the next timestep
-                                                                  const int16_t *__restrict__ must_do_list , // global force-compute ranges [len,s0,e0,…] (nullable)
-                                                                  float thr ,
-                                                                  int phase , // skip threshold (log2) + reverse-list phase
+                                                                  const int16_t *__restrict__ read_list,    // this phase's RLE keep-list (one row per CTA)
+                                                                  int16_t *__restrict__ write_list,         // RLE keep-list emitted for the next timestep
+                                                                  const int16_t *__restrict__ must_do_list, // global force-compute ranges [len,s0,e0,…] (nullable)
+                                                                  float thr,
+                                                                  int phase, // skip threshold (log2) + reverse-list phase
                                                                   // ── Tail KV-split ──
-                                                                  float *__restrict__ part_buf , // Split: the TailScratch workspace
-                                                                  int grid_nqb ,                       // real #q-blocks when the grid is 1-D (prefix/split);
-                                                                                                          //   0 ⇒ 2-D full grid (uses gridDim.x)
-                                                                  int split_ways ,                     // Split: G = strided parts per q-block (= the kv stride)
+                                                                  float *__restrict__ part_buf, // Split: the TailScratch workspace
+                                                                  int grid_nqb,                 // real #q-blocks when the grid is 1-D (prefix/split);
+                                                                                                //   0 ⇒ 2-D full grid (uses gridDim.x)
+                                                                  int split_ways,               // Split: G = strided parts per q-block (= the kv stride)
                                                                   // ── LiteAttention LPT work-balance reorder (lite full grid only) ──
-                                                                  const int *__restrict__ lpt_order  // lpt_order[grid slot] = work-group to run here (longest-first)
+                                                                  const int *__restrict__ lpt_order // lpt_order[grid slot] = work-group to run here (longest-first)
 ) {
     static_assert(!(isLite && Split), "lite has no tail KV-split; Split is dense-only");
     // ROADMAP (one CTA = one 384-row q-block of one (batch,head)):
@@ -178,8 +177,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
                 buffer_load_b32_to_lds(k_buffer, lds_row0 + c * KRowBytes, off, soff);
             }
         } else {
-            // BHSD: static stride → kv_row·stride·4 folds to a shift LLVM remats for free (0 spill). Keep single-VGPR-offset form
-            // byte-identical.
+            // BHSD: static stride → kv_row·stride·4 folds to a shift LLVM remats for free (0 spill). Keep single-VGPR-offset
+            // form byte-identical.
             #pragma unroll
             for (int c = 0; c < KRowsPerLoadWave; ++c) {
                 const int kv_row = KLoadRow(wave_in_group, c);
@@ -484,7 +483,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
             // Issue the next ring V-load BEFORE this chunk's MFMAs (latency lead).
             if (chunk + PvDepth < VtChunks)
                 cur = load_u32x4(v_buffer, (int)chunk_byte_off(kv_iter, chunk + PvDepth));
-            // v_pair[h] feeds all q-groups back-to-back before the next half — shorter V-reg lifetime than q-group-outer ordering.
+            // v_pair[h] feeds all q-groups back-to-back before the next half — shorter V-reg lifetime than q-group-outer
+            // ordering.
             #pragma unroll
             for (int h = 0; h < 2; ++h)
                 #pragma unroll
@@ -528,8 +528,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
                     scores[2][kv_sub][i] = -FLT_MAX;
                 }
         }
-        // Per-lane bmax fold runs HERE (not qk_phase). Softmax runs in P2 while the other group is in pv+qk → the v_max3 VALU
-        // chain hides under their MFMA writeback.
+        // Per-lane bmax fold runs HERE (not qk_phase). Softmax runs in P2 while the other group is in pv+qk → the v_max3
+        // VALU chain hides under their MFMA writeback.
         #pragma unroll
         for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
             float bm = -FLT_MAX;
@@ -555,8 +555,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
             if (lane == 0)
                 sverdict(wave_id, step & (VerdictRing - 1)) = skip_wave ? 1u : 0u;
             if (skip_wave) {
-                // Zero probs so the skipped pv adds nothing; the keep predicate guarantees this block never raises the running max →
-                // state stays correct.
+                // Zero probs so the skipped pv adds nothing; the keep predicate guarantees this block never raises the running
+                // max → state stays correct.
                 #pragma unroll
                 for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
                     #pragma unroll
@@ -679,8 +679,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
         if (!valid[q_group])
             continue;
         const float inv_sum = (row_sum[q_group] == 0.0f) ? 0.0f : fast_rcp(row_sum[q_group]);
-        // No PV mfma follows → packed v_pk_mul_f32 is safe. MaybeNaN pack4 scrubs residual NaN/Inf in o_acc from pathological
-        // inputs.
+        // No PV mfma follows → packed v_pk_mul_f32 is safe. MaybeNaN pack4 scrubs residual NaN/Inf in o_acc from
+        // pathological inputs.
         #pragma unroll
         for (int t = 0; t < HeadDimTiles; ++t) {
             o_acc[q_group][t] = o_acc[q_group][t] * inv_sum;
