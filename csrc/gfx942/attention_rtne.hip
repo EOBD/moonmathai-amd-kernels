@@ -9,4 +9,4 @@
 #define tail_workspace_bytes tail_workspace_bytes_rtne
 #define lite_workspace_bytes lite_workspace_bytes_rtne
 
-#include "attention_kernel.hip"
+#include "attention_kernel.h"
