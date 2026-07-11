@@ -583,7 +583,48 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
     int prev_block = -1, step = 0; // step counts PROCESSED blocks (drives K double-buffer parity)
     int kv_block = first_blk;      // current processed block
     bool has_work = has_any_block;
+    if (has_work) {
+        // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
+        // ended its RLE range" → record's flush.
+        int next_block;
+        bool has_next;
+        if constexpr (isLite) {
+            next_block = advance(kv_block, kv_stride);
+            has_next = (next_block >= 0);
+        } else {
+            next_block = kv_block + kv_stride;
+            has_next = (next_block < num_kv_blocks);
+        }
+        const bool block_closed_range = isLite ? !range_cont : false;
+        const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
+        if (group_a) { // P1
+            qk_phase(k_buf_cur, scores);
 
+            __builtin_amdgcn_s_barrier();
+
+            softmax(scores, probs, step, kv_block);
+            // tid 0 folds prev_block's skip verdict into the write-list RLE. Safe: vote stored to sverdict last iter
+            // (VerdictRing depth 2 keeps it live).
+            if (has_next)
+                prefetch_v_t_l1(kv_block);
+        } else {
+            if (has_next)
+                direct_lds_k(next_block, k_buf_next);
+
+            __builtin_amdgcn_s_barrier();
+
+            qk_phase(k_buf_cur, scores);
+        }
+        // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
+        // qk can't read stale K; lds_barrier covers LGKMCNT.
+        wait_vmcnt0();
+        lds_barrier();
+        prev_block = kv_block;
+        ++step;
+        prev_ended_range = block_closed_range;
+        kv_block = next_block;
+        has_work = has_next;
+    }
     while (has_work) {
         // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
         // ended its RLE range" → record's flush.
@@ -598,10 +639,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
         }
         const bool block_closed_range = isLite ? !range_cont : false;
         const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
-        const bool first = (step == 0);
         if (group_a) { // P1
-            if (!first)
-                pv_phase(prev_block, probs, step - 1);
+            pv_phase(prev_block, probs, step - 1);
             qk_phase(k_buf_cur, scores);
 
             __builtin_amdgcn_s_barrier();
@@ -610,21 +649,19 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
             // tid 0 folds prev_block's skip verdict into the write-list RLE. Safe: vote stored to sverdict last iter
             // (VerdictRing depth 2 keeps it live).
             if constexpr (isLite) {
-                if (tid == 0 && !first)
+                if (tid == 0)
                     record(prev_block, step - 1, prev_ended_range);
             }
             if (has_next)
                 prefetch_v_t_l1(kv_block);
         } else {
-            if (!first)
-                softmax(scores, probs, step - 1, prev_block);
+            softmax(scores, probs, step - 1, prev_block);
             if (has_next)
                 direct_lds_k(next_block, k_buf_next);
 
             __builtin_amdgcn_s_barrier();
 
-            if (!first)
-                pv_phase(prev_block, probs, step - 1);
+            pv_phase(prev_block, probs, step - 1);
             qk_phase(k_buf_cur, scores);
         }
         // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
