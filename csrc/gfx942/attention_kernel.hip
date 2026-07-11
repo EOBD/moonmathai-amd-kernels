@@ -603,14 +603,9 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
             if (!first)
                 pv_phase(prev_block, probs, step - 1);
             qk_phase(k_buf_cur, scores);
-        } else {
-            if (!first)
-                softmax(scores, probs, step - 1, prev_block);
-            if (has_next)
-                direct_lds_k(next_block, k_buf_next);
-        }
-        __builtin_amdgcn_s_barrier();
-        if (group_a) { // P2
+
+            __builtin_amdgcn_s_barrier();
+
             softmax(scores, probs, step, kv_block);
             // tid 0 folds prev_block's skip verdict into the write-list RLE. Safe: vote stored to sverdict last iter
             // (VerdictRing depth 2 keeps it live).
@@ -621,6 +616,13 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
             if (has_next)
                 prefetch_v_t_l1(kv_block);
         } else {
+            if (!first)
+                softmax(scores, probs, step - 1, prev_block);
+            if (has_next)
+                direct_lds_k(next_block, k_buf_next);
+
+            __builtin_amdgcn_s_barrier();
+
             if (!first)
                 pv_phase(prev_block, probs, step - 1);
             qk_phase(k_buf_cur, scores);
