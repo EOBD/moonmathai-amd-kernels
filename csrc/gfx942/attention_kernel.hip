@@ -455,22 +455,27 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
         return (uint32_t)(VtLayout(kv_iter, chunk, lane) * 2); // bf16 elems → bytes
     };
 
+    constexpr int PvDepth = 4; // V_t prefetch ring depth (VtChunks=16 super-chunks / kv-iter)
     // verdict_step = processing step of the block being pv'd (verdict-ring slot; ignored !isLite). Part B soft
     // block-skip: a "skip" wave does NO pv (its probs were zeroed in softmax → result unchanged), dropping 0-adding MFMAs
     // + V_t loads. Vote is in LDS from this wave's softmax (A: prev iter P2; B: this iter P1), visible across record()'s
     // barriers.
-    auto pv_phase = [&](int kv_iter, const bf16x4_t probs[QTilesPerWave][KvSubtiles], int verdict_step) {
+    auto pv_phase_preload = [&](int kv_iter, const bf16x4_t probs[QTilesPerWave][KvSubtiles], int verdict_step, u32x4_t v_ring[PvDepth]) {
         if constexpr (isLite) {
             if (sverdict(wave_id, verdict_step & (VerdictRing - 1)))
                 return;
         }
-        constexpr int PvDepth = 4; // V_t prefetch ring depth (VtChunks=16 super-chunks / kv-iter)
-        mfma_prio_hi();
-        sched_fence();
-        u32x4_t v_ring[PvDepth];
         #pragma unroll
         for (int p = 0; p < PvDepth; ++p)
             v_ring[p] = load_u32x4(v_buffer, (int)chunk_byte_off(kv_iter, p));
+    };
+    auto pv_phase_compute = [&](int kv_iter, const bf16x4_t probs[QTilesPerWave][KvSubtiles], int verdict_step, u32x4_t v_ring[PvDepth]) {
+        if constexpr (isLite) {
+            if (sverdict(wave_id, verdict_step & (VerdictRing - 1)))
+                return;
+        }
+        mfma_prio_hi();
+        sched_fence();
         #pragma unroll
         for (int chunk = 0; chunk < VtChunks; ++chunk) {
             // chunk in [0,16): d_tile=chunk/2 (hd-tile 0..7); kv_sub0=(chunk&1)*2 (kv-subtile pair base, even→{0,1}
@@ -583,7 +588,8 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
     int prev_block = -1, step = 0; // step counts PROCESSED blocks (drives K double-buffer parity)
     int kv_block = first_blk;      // current processed block
     bool has_work = has_any_block;
-    if (has_work) {
+    if (!has_work) return;
+    {
         // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
         // ended its RLE range" → record's flush.
         int next_block;
@@ -640,7 +646,9 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
         const bool block_closed_range = isLite ? !range_cont : false;
         const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
         if (group_a) { // P1
-            pv_phase(prev_block, probs, step - 1);
+            u32x4_t v_ring[PvDepth];
+            pv_phase_preload(prev_block, probs, step - 1, v_ring);
+            pv_phase_compute(prev_block, probs, step - 1, v_ring);
             qk_phase(k_buf_cur, scores);
 
             __builtin_amdgcn_s_barrier();
@@ -658,10 +666,13 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
             softmax(scores, probs, step - 1, prev_block);
             if (has_next)
                 direct_lds_k(next_block, k_buf_next);
+            
+            u32x4_t v_ring[PvDepth];
+            pv_phase_preload(prev_block, probs, step - 1, v_ring);
 
             __builtin_amdgcn_s_barrier();
 
-            pv_phase(prev_block, probs, step - 1);
+            pv_phase_compute(prev_block, probs, step - 1, v_ring);
             qk_phase(k_buf_cur, scores);
         }
         // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
@@ -678,8 +689,11 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
     // softmax (A did its at P2), both owe the final pv. Lite then flushes the last block's range-end vote + RLE length.
     if (!group_a && step > 0)
         softmax(scores, probs, step - 1, prev_block);
-    if (step > 0)
-        pv_phase(prev_block, probs, step - 1);
+    if (step > 0) {
+        u32x4_t v_ring[PvDepth];
+        pv_phase_preload(prev_block, probs, step - 1, v_ring);
+        pv_phase_compute(prev_block, probs, step - 1, v_ring);
+    }
     if constexpr (isLite) {
         lds_barrier(); // group B's last-block vote → visible to tid 0
         if (tid == 0 && step > 0) {
