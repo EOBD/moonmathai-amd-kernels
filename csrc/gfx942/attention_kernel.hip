@@ -588,6 +588,7 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
     int prev_block = -1, step = 0; // step counts PROCESSED blocks (drives K double-buffer parity)
     int kv_block = first_blk;      // current processed block
     bool has_work = has_any_block;
+    u32x4_t a_v_ring[PvDepth];
     if (!has_work) return;
     {
         // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
@@ -611,8 +612,10 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
             softmax(scores, probs, step, kv_block);
             // tid 0 folds prev_block's skip verdict into the write-list RLE. Safe: vote stored to sverdict last iter
             // (VerdictRing depth 2 keeps it live).
-            if (has_next)
+            if (has_next) {
                 prefetch_v_t_l1(kv_block);
+                pv_phase_preload(kv_block, probs, step - 1 + 1, a_v_ring);
+            }
         } else {
             if (has_next)
                 direct_lds_k(next_block, k_buf_next);
@@ -646,9 +649,7 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
         const bool block_closed_range = isLite ? !range_cont : false;
         const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
         if (group_a) { // P1
-            u32x4_t v_ring[PvDepth];
-            pv_phase_preload(prev_block, probs, step - 1, v_ring);
-            pv_phase_compute(prev_block, probs, step - 1, v_ring);
+            pv_phase_compute(prev_block, probs, step - 1, a_v_ring);
             qk_phase(k_buf_cur, scores);
 
             __builtin_amdgcn_s_barrier();
@@ -660,8 +661,10 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
                 if (tid == 0)
                     record(prev_block, step - 1, prev_ended_range);
             }
-            if (has_next)
+            if (has_next) {
                 prefetch_v_t_l1(kv_block);
+                pv_phase_preload(kv_block, probs, step - 1 + 1, a_v_ring);
+            }
         } else {
             softmax(scores, probs, step - 1, prev_block);
             if (has_next)
