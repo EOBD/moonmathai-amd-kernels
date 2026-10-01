@@ -42,10 +42,12 @@ name = "pytorch-rocm72"
 url = "https://download.pytorch.org/whl/rocm7.2"
 
 
-# Build requires ROCm PyTorch 2.x and hipcc on PATH.
-# torch is declared in [build-system].requires so the package builds with
-# build isolation (uv resolves it from the pytorch-rocm72 index):
+# Building needs ROCm PyTorch 2.x and hipcc on PATH.
+# torch lives in [build-system].requires so the package builds under isolation
+# (uv resolves it from the pytorch-rocm72 index):
 #   uv pip install -e .
-# To reuse an already-installed torch and skip re-downloading it into the
-# isolated build env, you can still pass --no-build-isolation:
+# Pass --no-build-isolation to reuse an already-installed torch instead of
+# re-downloading it into the isolated build env:
 #   uv pip install -e . --no-build-isolation
+# GPU_ARCHS selects which kernels to build: "native" (default; the GPUs
+# rocminfo reports) or an explicit list, e.g. GPU_ARCHS=gfx942 uv pip install -e .

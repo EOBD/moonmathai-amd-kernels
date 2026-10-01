@@ -30,14 +30,21 @@ bf16 activations. [Details below](#mxfp4-moe-gemms).
 
 ## Install
 
-Requires ROCm with `hipcc` on PATH and a gfx942 device.
+Requires ROCm with `hipcc` on PATH.
 
 ```sh
-pip install -e .
+pip install -e .                              # GPU_ARCHS=native: targets that rocminfo lists
+GPU_ARCHS=gfx942 pip install -e .             # explicit targets, e.g. for a GPU-less build machine
 ```
 
-That compiles the MHA kernel in all three bf16 rounding modes (RTNA, RTNE, RTZ),
-the MLA decode kernel and the MXFP4 MoE GEMMs into the package's `_C` extension.
+As in AITER, `GPU_ARCHS` picks the targets (`CDNA3_ARCH` still works when it is unset). Each
+arch folder in `csrc/` is its own extension module, compiled for that arch only:
+
+- `moonmath_amd._C_gfx942` — the MHA kernel in all three bf16 rounding modes (RTNA, RTNE, RTZ),
+  the MLA decode kernel and the MXFP4 MoE GEMMs.
+
+Ops pick the module of the GPU they run on at call time, and say so when this build or this GPU
+has no kernels for them.
 
 ## Use
 
@@ -47,20 +54,20 @@ the MLA decode kernel and the MXFP4 MoE GEMMs into the package's `_C` extension.
 import torch
 import moonmath_amd as ma
 
-# diffusion-style BSHD tensors, no transpose needed
+# diffusion-style BSHD tensors, so no transpose is needed
 q = torch.randn(2, 8192, 24, 128, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(2, 8192, 24, 128, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(2, 8192, 24, 128, dtype=torch.bfloat16, device="cuda")
 
-out      = ma.forward(q, k, v, layout="bshd")                    # RTNE rounding by default
+out      = ma.forward(q, k, v, layout="bshd")                    # RTNA rounding is the default
 out_rtna = ma.forward(q, k, v, layout="bshd", round_mode="rtna")
 out_rtz  = ma.forward(q, k, v, layout="bshd", round_mode="rtz")
 
-# classic BHSD works the same way (default layout)
+# classic BHSD behaves identically (it is the default layout)
 qh = q.transpose(1, 2).contiguous()
 out_h = ma.forward(qh, qh, qh)
 
-# cross-attention: any KV length, no padding
+# cross-attention: any KV length, zero padding
 ctx = torch.randn(2, 512, 24, 128, dtype=torch.bfloat16, device="cuda")
 out_x = ma.forward(q, ctx, ctx, layout="bshd")
 ```
@@ -82,11 +89,11 @@ import moonmath_amd as ma
 B, H, S, LAT, ROPE = 8, 16, 8192, 512, 64
 scale, kv_scale = (LAT + ROPE) ** -0.5, 1.0 / 32.0
 pool = (torch.randn(B * S, 1, LAT + ROPE, device="cuda") / kv_scale).to(torch.float8_e4m3fnuz)
-kv_indices = torch.arange(B * S, dtype=torch.int32, device="cuda")  # page_size 1, any permutation
+kv_indices = torch.arange(B * S, dtype=torch.int32, device="cuda")  # page_size 1, so any permutation works
 kv_indptr = torch.arange(B + 1, dtype=torch.int32, device="cuda") * S
 seq_lens = torch.full((B,), S, dtype=torch.int32, device="cuda")
 
-# q_len 1 is plain decode; q_len 4 is a draft window where position t attends KV [0, S - q_len + t].
+# q_len 1 is plain decode; q_len 4 is a draft window where position t sees KV [0, S - q_len + t].
 for q_len in (1, 4):
     q_lat = torch.randn(B * q_len, H, LAT, dtype=torch.bfloat16, device="cuda")
     q_pe = torch.randn(B * q_len, H, ROPE, dtype=torch.bfloat16, device="cuda")
@@ -151,7 +158,7 @@ shards of the expert width; at any other K `mxfp4_moe_down_block_m` returns 0 an
 the down projection runs on the gate/up kernel with `EPI_NONE`.
 
 ```python
-w13 = ma.repack_mxfp4(w13_raw)          # once, at weight load
+w13 = ma.repack_mxfp4(w13_raw)          # do this once, at weight-load time
 w13s = ma.repack_mxfp4_scales(w13s_raw)
 
 bm = ma.mxfp4_moe_gateup_block_m(rows, num_active_experts)
@@ -190,10 +197,10 @@ per expert, so most of each tile is padding and only the 16-row tile is competit
 Reproduce with:
 
 ```sh
-python benchmark/bench_moe.py --markdown            # the table above
-python benchmark/bench_moe.py --tokens 8 512 2048   # any other token counts
-python benchmark/bench_moe.py --layout ep8          # expert-parallel geometry
-python benchmark/bench_moe.py --show-tiles          # every AITER tile, not just the winner
+python benchmark/bench_moe.py --markdown            # reproduces the table above
+python benchmark/bench_moe.py --tokens 8 512 2048   # other token counts
+python benchmark/bench_moe.py --layout ep8          # an expert-parallel geometry
+python benchmark/bench_moe.py --show-tiles          # all AITER tiles, not only the winner
 ```
 
 The bench needs AITER on the path for the Triton baseline
@@ -202,11 +209,11 @@ both kernels against a dense reference that never sees the repacked weights.
 
 ## Layout / build internals
 
-- `csrc/attention_kernel.hip` — the MHA kernel (attention + V pre-transpose).
-- `csrc/mla_decode_a16w8.hip` — MLA absorbed decode, any q_len, optional DCP.
-- `csrc/mxfp4_moe_gateup.hip`, `csrc/mxfp4_moe_down.hip` — the MoE GEMMs.
-- `csrc/*_api.cpp` — the torch bindings for each.
-- `moonmath_amd/` — Python package (ctypes wrapper around the `.so`).
+- `csrc/gfx942/attention_kernel.hip` — the MHA kernel (attention + V pre-transpose).
+- `csrc/gfx942/mla_decode_a16w8.hip` — MLA absorbed decode, any q_len, optional DCP.
+- `csrc/gfx942/mxfp4_moe_gateup.hip`, `csrc/gfx942/mxfp4_moe_down.hip` — the MoE GEMMs.
+- `csrc/<arch>/*_api.cpp` — the torch bindings for each.
+- `moonmath_amd/` — Python package; `_arch.py` picks the module of the live GPU.
 - `Makefile` — direct kernel build (`make` produces root-level `.so` variants).
 - `benchmark/runner.py` — single-shape benchmark vs AITER and (optionally) Modular MAX.
 - `benchmark/bench_table.py` — multi-shape sweep with median-over-passes timing.
@@ -282,8 +289,8 @@ Against Modular MAX we are 1.37–1.59× faster everywhere.
 Reproduce with:
 
 ```sh
-# --no-max gives the cleanest ours/AITER numbers (MAX's runtime perturbs co-located timings);
-# drop it to also measure Modular MAX.
+# --no-max yields the cleanest ours-vs-AITER numbers (MAX's runtime perturbs co-located timings);
+# omit it to also measure Modular MAX.
 python bench_table.py --benchmark-iters 30 --warmup-iters 8 --passes 5 --no-max
 ```
 
@@ -293,19 +300,19 @@ python bench_table.py --benchmark-iters 30 --warmup-iters 8 --passes 5 --no-max
 git clone https://github.com/moonmath-ai/cdna3-attention.git
 cd cdna3-attention
 
-# python env (ninja required for AITER JIT and our kernel build)
+# python env (ninja is required for the AITER JIT and our kernel build)
 conda create -n cdna3 python=3.11 ninja -y
 conda activate cdna3
 
-# install package + bench deps (torch, amd-aiter, numpy; optional max)
+# install the package and bench deps (torch, amd-aiter, numpy; max optional)
 pip install -e '.[bench]'
 
-# --- or with uv ---
+# --- alternatively, with uv ---
 uv venv --python 3.11
 source .venv/bin/activate
 uv pip install -e '.[bench]'
 
-# run. First AITER call JIT-builds fmha modules (~50s, then cached under ~/.aiter/).
+# run. The first AITER call JIT-builds fmha modules (~50s, then cached under ~/.aiter/).
 python benchmark/runner.py --warmup-iters 8 --benchmark-iters 30
 ```
 
@@ -346,12 +353,12 @@ why the script pins H and q_len rather than sweeping them.
 Reproduce with:
 
 ```sh
-# Needs AITER importable with its gfx942 MLA kernels built (hsa/gfx942/mla/*.co).
-# Point AITER_PATH at a checkout if it isn't already on sys.path.
+# Requires an importable AITER with its gfx942 MLA kernels built (hsa/gfx942/mla/*.co).
+# Set AITER_PATH to a checkout if it is not already on sys.path.
 python benchmark/bench_mla.py
 
-python benchmark/bench_mla.py --shapes 8:150000,16:150000   # pick shapes
-python benchmark/bench_mla.py -v                            # show the num_kv_splits sweep
+python benchmark/bench_mla.py --shapes 8:150000,16:150000   # pick specific shapes
+python benchmark/bench_mla.py -v                            # display the num_kv_splits sweep
 ```
 
 The script validates both kernels against a chunked fp32 streaming-softmax reference

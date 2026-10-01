@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Profile the CDNA3 attention HIP kernel with rocprof-compute (PMC) + rocprofv3 (ATT).
-# Generates ISA analysis HTML with HIP source matching, then zips everything up.
+# Profile the CDNA3 attention HIP kernel using rocprof-compute (PMC) and rocprofv3 (ATT).
+# Emits ISA analysis HTML matched to HIP source, then packages the results into a zip.
 #
-# Usage (from repo root):
+# Usage (run from the repo root):
 #   ./tools/rocprof_profile.sh
-#   WORKLOAD_NAME=attn_run1 ./tools/rocprof_profile.sh          # fixed name
+#   WORKLOAD_NAME=attn_run1 ./tools/rocprof_profile.sh          # pin the workload name
 #   WARMUP_ITERS=5 ./tools/rocprof_profile.sh
 #   ROCPROF_NO_UI_TRACE=1 ./tools/rocprof_profile.sh             # skip ATT (faster)
 #   ROCPROF_NO_SUMMARY=1 ./tools/rocprof_profile.sh              # skip analyze + summary CSV
-#   NO_ZIP=1 ./tools/rocprof_profile.sh                          # skip final zip
+#   NO_ZIP=1 ./tools/rocprof_profile.sh                          # skip the final zip
 #   ROCPROF_UI_ATT_LIBRARY_PATH=/path/to/decoder ./tools/rocprof_profile.sh
 #   PYTHON=/path/to/python ./tools/rocprof_profile.sh
 #
-# Requires: rocprof-compute, rocprofv3, libamdhip64.so (ROCm).
-# librocprof-trace-decoder.so auto-detected from:
+# Needs rocprof-compute, rocprofv3 and libamdhip64.so (ROCm).
+# librocprof-trace-decoder.so is auto-detected from:
 #   1) /opt/rocm/lib
 #   2) ../../rocprof-trace-decoder/releases/linux_glibc_2_28_x86_64 (sibling checkout)
 
@@ -23,12 +23,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT}"
 
-# Prepend conda lib so rocprofiler-sdk env reset doesn't drop libstdc++.
+# Prepend the conda lib dir so the rocprofiler-sdk env reset keeps libstdc++ visible.
 if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
   export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
-# Auto-detect librocprof-trace-decoder.so for ATT.
+# Locate librocprof-trace-decoder.so (needed by ATT).
 if [[ -z "${ROCPROF_UI_ATT_LIBRARY_PATH:-}" ]]; then
   _decoder_found=""
   for _d in /opt/rocm/lib /opt/rocm-*/lib; do
@@ -46,7 +46,7 @@ if [[ -z "${ROCPROF_UI_ATT_LIBRARY_PATH:-}" ]]; then
   fi
 fi
 
-# Resolve Python interpreter.
+# Pick the Python interpreter.
 PYTHON="${PYTHON:-python}"
 if [[ "${PYTHON}" == "python" && -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
   PYTHON="${CONDA_PREFIX}/bin/python"
@@ -55,7 +55,7 @@ if ! PYTHON="$(command -v "${PYTHON}")"; then
   echo "error: PYTHON not found" >&2; exit 1
 fi
 
-# Locate rocprof-compute.
+# Find rocprof-compute.
 ROCPROF_COMPUTE="${ROCPROF_COMPUTE:-}"
 if [[ -z "${ROCPROF_COMPUTE}" ]]; then
   if command -v rocprof-compute &>/dev/null; then
@@ -71,13 +71,13 @@ if ! command -v rocprofv3 &>/dev/null; then
   echo "error: rocprofv3 not found on PATH" >&2; exit 1
 fi
 
-# Build the kernel shared library with debug info if not already built.
+# Build the kernel shared library if it is not already present.
 if ! compgen -G "${ROOT}/libattention"*.so >/dev/null; then
   echo "Building libattention*.so..."
   make -C "${ROOT}"
 fi
 
-# Workload paths.
+# Workload output paths.
 ROC_OUT_DIR="${ROC_OUT_DIR:-${ROOT}/rocprof_out}"
 WORKLOAD_NAME="${WORKLOAD_NAME:-$(date +%Y%m%d_%H%M%S)}"
 WARMUP_ITERS="${WARMUP_ITERS:-3}"
@@ -88,7 +88,7 @@ PMC_DISPATCH_INFO="${WORKLOAD_PATH}/pmc_dispatch_info.csv"
 PMC_PERF="${WORKLOAD_PATH}/pmc_perf.csv"
 export PMC_DISPATCH_INFO PMC_PERF
 
-# Locate ISA HTML generator — prefer local copy, fall back to sibling conv3amd repo.
+# Find the ISA HTML generator: local copy first, then the sibling conv3amd repo.
 FORMAT_ISA_PY="${SCRIPT_DIR}/rocprof_att_stats_to_isa_html.py"
 if [[ ! -f "${FORMAT_ISA_PY}" ]]; then
   _sibling="$(cd "${ROOT}/.." && pwd)/conv3amd/rocprof_att_stats_to_isa_html.py"
@@ -101,7 +101,7 @@ if [[ ! -f "${MERGE_PY}" ]]; then
   [[ -f "${_sibling}" ]] && MERGE_PY="${_sibling}"
 fi
 
-# Generate ISA HTML from ATT stats CSVs.
+# Build ISA HTML from the ATT stats CSVs.
 generate_isa_html() {
   local _utt="${ROCPROF_UI_TRACE_DIR:-${WORKLOAD_PATH}/ui_thread_trace}"
   [[ -f "${FORMAT_ISA_PY}" ]] || { echo "warning: ${FORMAT_ISA_PY} not found; skipping ISA HTML" >&2; return 0; }
@@ -115,7 +115,7 @@ generate_isa_html() {
   "${PYTHON}" "${FORMAT_ISA_PY}" "${_files[@]}" || echo "warning: ISA HTML generation failed" >&2
 }
 
-# Verify rocprof-compute Python deps.
+# Check that rocprof-compute's Python dependencies are importable.
 if ! "${PYTHON}" - <<'PY'
 from importlib import metadata
 for name in ("pyyaml", "PyYAML"):
@@ -142,8 +142,8 @@ else
   ROC_PROFILE_RUNNER_ARGV=(--warmup-iters "${WARMUP_ITERS}")
 fi
 
-# Write a temp app launcher (rocprofiler-sdk execs a new process and resets LD_LIBRARY_PATH,
-# so we need a real file to re-prepend the conda lib path before running runner.py).
+# Write a throwaway app launcher: rocprofiler-sdk execs a fresh process and resets
+# LD_LIBRARY_PATH, so a real script must re-prepend the conda lib path before runner.py.
 _APP_SH="${SCRIPT_DIR}/.rocprof_app_$$.sh"
 trap 'rm -f "${_APP_SH}"' EXIT
 cat > "${_APP_SH}" <<'APPSH'
@@ -158,7 +158,7 @@ chmod +x "${_APP_SH}"
 
 mkdir -p "${ROC_OUT_DIR}"
 
-# --- PMC profile (all counter sections) ---
+# --- PMC profile (every counter section) ---
 echo "=== rocprof-compute PMC profile ==="
 echo "  workload: ${WORKLOAD_NAME}  path: ${WORKLOAD_PATH}"
 "${PYTHON}" "${ROCPROF_COMPUTE}" profile \
@@ -169,12 +169,12 @@ echo "  workload: ${WORKLOAD_NAME}  path: ${WORKLOAD_PATH}"
 
 echo "PMC profile done: ${WORKLOAD_PATH}"
 
-# --- ATT (Advanced Thread Trace) for ROCprof Compute Viewer ---
+# --- ATT (Advanced Thread Trace), consumed by ROCprof Compute Viewer ---
 if [[ -z "${ROCPROF_NO_UI_TRACE:-}" ]]; then
   RCV_UI_PARENT="${ROCPROF_UI_TRACE_DIR:-${WORKLOAD_PATH}/ui_thread_trace}"
   mkdir -p "${RCV_UI_PARENT}"
   echo "=== rocprofv3 ATT -> ${RCV_UI_PARENT} ==="
-  # --att-serialize-all is on by default on CDNA3 for reliable capture; ROCPROF_UI_ATT_SERIALIZE_ALL=0 to disable.
+  # --att-serialize-all defaults on for CDNA3 to capture reliably; set ROCPROF_UI_ATT_SERIALIZE_ALL=0 to turn it off.
   _rv3=(rocprofv3 --advanced-thread-trace 1 --kernel-trace 1 --att-serialize-all 1 -d "${RCV_UI_PARENT}")
   if [[ -n "${ROCPROF_UI_ATT_LIBRARY_PATH:-}" ]]; then
     read -r -a _att_lib_dirs <<<"${ROCPROF_UI_ATT_LIBRARY_PATH//:/ }"
@@ -200,10 +200,10 @@ if [[ -z "${ROCPROF_NO_UI_TRACE:-}" ]]; then
   fi
 fi
 
-# --- rocprof-compute analyze + summary CSV ---
+# --- rocprof-compute analyze, then a summary CSV ---
 if [[ -z "${ROCPROF_NO_SUMMARY:-}" ]]; then
   if [[ -f "${PMC_DISPATCH_INFO}" || -f "${PMC_PERF}" ]] && [[ -f "${MERGE_PY}" ]]; then
-    # Auto-detect dispatch id for our attention_forward kernel.
+    # Derive the dispatch id of the attention_forward kernel.
     DISPATCH_ID="${ROCPROF_SUMMARY_DISPATCH:-}"
     if [[ -z "${DISPATCH_ID}" ]]; then
       DISPATCH_ID="$(
@@ -261,20 +261,20 @@ PY
   fi
 fi
 
-# --- ISA HTML ---
+# --- ISA HTML report ---
 generate_isa_html
 
-# --- Zip everything up ---
+# --- Package everything ---
 if [[ -z "${NO_ZIP:-}" ]]; then
   ZIP_PATH="${ROC_OUT_DIR}/${WORKLOAD_NAME}.zip"
   echo "=== Packaging results -> ${ZIP_PATH} ==="
-  # Include: workload dir + hip source file for viewer reference
+  # Bundle the workload dir plus the HIP source for viewer reference
   (
     cd "${ROC_OUT_DIR}"
     zip -r "${ZIP_PATH}" "${WORKLOAD_NAME}/"
   )
-  # Also include the HIP source so ISA HTML source references are portable
-  zip -j "${ZIP_PATH}" "${ROOT}/csrc/attention_kernel.hip"
+  # Keep the HIP source alongside so ISA HTML source references stay portable
+  zip -j "${ZIP_PATH}" "${ROOT}/csrc/gfx942/attention_kernel.hip"
   echo "Done: ${ZIP_PATH}"
   echo "  Extract and open ui_thread_trace/stats_*_isa.html in a browser."
   echo "  For ROCprof Compute Viewer: File -> Import -> Rocprofv3 UI -> pick ui_thread_trace/"

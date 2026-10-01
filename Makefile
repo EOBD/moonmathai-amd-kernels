@@ -1,24 +1,24 @@
-# CDNA3 attention forward kernel
+# Attention forward kernel for CDNA3.
 #
-# Build:    make                                   — builds RTNE and RTZ variants
-#           make rtne                              — RTNE pack only
-#           make rtz                               — RTZ pack only
-#           make EXTRA_LLVM_FLAGS="--save-temps"   — keep IR/asm intermediates
+# Build:    make                                   — build both RTNE and RTZ variants
+#           make rtne                              — build the RTNE pack only
+#           make rtz                               — build the RTZ pack only
+#           make EXTRA_LLVM_FLAGS="--save-temps"   — keep the IR/asm intermediates
 #
-# Run:      python runner.py                       — bench HIP RTNE/RTZ vs AITER
+# Run:      python runner.py                       — benchmark HIP RTNE/RTZ against AITER
 
 HIPCC ?= hipcc
 ARCH = gfx942
 
 TARGET_RTNE = libattention_rtne.so
 TARGET_RTZ  = libattention_rtz.so
-SRC         = csrc/attention_kernel.hip
+SRC         = csrc/gfx942/attention_kernel.hip
 
 EXTRA_LLVM_FLAGS ?=
 HIPCC_FLAGS = -shared -fPIC -O3 --offload-arch=$(ARCH) \
               -ffast-math -fno-math-errno \
               -mllvm -amdgpu-early-inline-all=true \
-              -Icsrc \
+              -Icsrc/gfx942 \
               $(EXTRA_LLVM_FLAGS)
 
 all: $(TARGET_RTNE) $(TARGET_RTZ)

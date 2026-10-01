@@ -9,7 +9,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-# Reference notes (order-of-magnitude; exact numbers vary by chip/voltage)
+# Reference figures: order-of-magnitude only; exact values depend on chip and voltage
 LATENCY_NOTES = """
 <ul>
 <li><b>VMEM</b> (buffer/global load): typically ~400–800+ cycles; compiler schedules
@@ -67,7 +67,7 @@ def classify(line: str) -> str:
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     temp_asm = root / "temp" / "attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.s"
-    root_asm = root / "csrc" / "attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.s"
+    root_asm = root / "csrc" / "gfx942" / "attention_kernel-hip-amdgcn-amd-amdhsa-gfx942.s"
     if len(sys.argv) > 1:
         asm = Path(sys.argv[1])
     elif temp_asm.is_file():
@@ -119,7 +119,7 @@ def main() -> int:
                 }
             )
 
-    # Pair waits with preceding VMEM burst (heuristic: lines since last wait)
+    # Pair each wait with the preceding VMEM burst (heuristic: source lines since the last wait)
     wait_pairs = []
     last_wait_line = kernel_start or 1
     for w in waits:

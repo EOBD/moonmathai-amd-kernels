@@ -46,7 +46,7 @@ Both ops run on the current stream and never sync with the host.
 """
 import torch
 
-import moonmath_amd._C as _C
+from ._arch import gfx942_op
 
 __all__ = [
     "repack_mxfp4",
@@ -63,7 +63,7 @@ __all__ = [
     "EPI_SITU",
 ]
 
-#  Bytes of one lane's weight granule: 16 bytes = 32 k of one column.
+#  One lane's weight granule: 16 bytes, i.e. 32 k-values of a single column.
 _B_GRANULE = 16
 
 EPI_NONE = 0
@@ -71,7 +71,7 @@ EPI_SITU = 1
 
 
 # ---------------------------------------------------------------------------
-#  Weight preparation.  Offline, once at load, and both are required.
+#  Weight prep: offline, once at load, and both transforms are required.
 # ---------------------------------------------------------------------------
 def _canon_neg_zero(nib: torch.Tensor) -> torch.Tensor:
     """MXFP4 negative zero (nibble 0x8) -> +0.  See :func:`repack_mxfp4`."""
@@ -110,12 +110,12 @@ def repack_mxfp4(B: torch.Tensor) -> torch.Tensor:
     if Kh % _B_GRANULE:
         raise ValueError(f"repack_mxfp4: K/2 must be a multiple of {_B_GRANULE}, got {Kh}")
 
-    lo = _canon_neg_zero(B & 0x0F).reshape(E, N, Kh // 4, 4)       # k = 8i + 2j
-    hi = _canon_neg_zero(B >> 4).reshape(E, N, Kh // 4, 4)         # k = 8i + 2j + 1
-    v = torch.stack([lo, hi], dim=-1).reshape(E, N, Kh // 4, 8)    # k = 8i + m
+    lo = _canon_neg_zero(B & 0x0F).reshape(E, N, Kh // 4, 4)       # low nibbles, k = 8i + 2j
+    hi = _canon_neg_zero(B >> 4).reshape(E, N, Kh // 4, 4)         # high nibbles, k = 8i + 2j + 1
+    v = torch.stack([lo, hi], dim=-1).reshape(E, N, Kh // 4, 8)    # interleaved, k = 8i + m
     R = (v[..., 0:4] | (v[..., 4:8] << 4)).reshape(E, N, Kh)
 
-    #  (n, granule) -> (granule, n); .contiguous() is what actually reorders.
+    #  Swap (n, granule) -> (granule, n); the .contiguous() does the real reorder.
     return (R.reshape(E, N, Kh // _B_GRANULE, _B_GRANULE)
              .permute(0, 2, 1, 3).contiguous())
 
@@ -135,11 +135,11 @@ def repack_mxfp4_scales(Bs: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-#  Planners.  Pure host arithmetic -- no device work, safe under graph capture.
+#  Planners: pure host arithmetic, no device work, safe under graph capture.
 # ---------------------------------------------------------------------------
 def mxfp4_moe_gateup_block_m(num_valid_tokens: int, num_active_experts: int) -> int:
     """Tile height for gate/up: 16, 32 or 48, from rows per expert."""
-    return _C.mxfp4_moe_gateup_block_m(num_valid_tokens, num_active_experts)
+    return gfx942_op("mxfp4_moe_gateup_block_m")(num_valid_tokens, num_active_experts)
 
 
 def mxfp4_moe_gateup_supports_k(K: int) -> bool:
@@ -148,7 +148,7 @@ def mxfp4_moe_gateup_supports_k(K: int) -> bool:
     Its slab pipeline only balances its vmcnt rungs over a whole pair, so the
     slab count must be even: K a multiple of 256.
     """
-    return bool(_C.mxfp4_moe_gateup_supports_k(K))
+    return bool(gfx942_op("mxfp4_moe_gateup_supports_k")(K))
 
 
 def mxfp4_moe_down_block_m(num_valid_tokens: int, num_active_experts: int, K: int) -> int:
@@ -159,18 +159,18 @@ def mxfp4_moe_down_block_m(num_valid_tokens: int, num_active_experts: int, K: in
     (K = 384/512/768). Under expert parallelism the experts are unsharded and
     K is the full width; route those to gate/up with EPI_NONE.
     """
-    return _C.mxfp4_moe_down_block_m(num_valid_tokens, num_active_experts, K)
+    return gfx942_op("mxfp4_moe_down_block_m")(num_valid_tokens, num_active_experts, K)
 
 
 def mxfp4_moe_down_nt(num_valid_tokens: int, num_active_experts: int) -> int:
     """Column tiles per wave for down: 1 or 2."""
-    return _C.mxfp4_moe_down_nt(num_valid_tokens, num_active_experts)
+    return gfx942_op("mxfp4_moe_down_nt")(num_valid_tokens, num_active_experts)
 
 
 def mxfp4_moe_down_n_steps(num_m_blocks: int, N: int, num_cus: int, block_m: int,
                            nt: int) -> int:
     """How many BN-wide column chunks one down workgroup sweeps."""
-    return _C.mxfp4_moe_down_n_steps(num_m_blocks, N, num_cus, block_m, nt)
+    return gfx942_op("mxfp4_moe_down_n_steps")(num_m_blocks, N, num_cus, block_m, nt)
 
 
 def mxfp4_moe_down_plan(num_valid_tokens: int, num_active_experts: int, N: int, K: int,
@@ -192,7 +192,7 @@ def mxfp4_moe_down_plan(num_valid_tokens: int, num_active_experts: int, N: int, 
 
 
 # ---------------------------------------------------------------------------
-#  Ops
+#  Kernel entry points
 # ---------------------------------------------------------------------------
 def mxfp4_moe_gateup(A: torch.Tensor, B: torch.Tensor, Bs: torch.Tensor, C: torch.Tensor,
                      topk_weights, sorted_token_ids: torch.Tensor,
@@ -212,9 +212,9 @@ def mxfp4_moe_gateup(A: torch.Tensor, B: torch.Tensor, Bs: torch.Tensor, C: torc
     must be the live int32 device tensor the alignment produced, not a host
     scalar.
     """
-    _C.mxfp4_moe_gateup(A, B, Bs, C, topk_weights, sorted_token_ids, expert_ids,
-                        num_tokens_post_padded, num_m_blocks, block_m, num_valid_tokens,
-                        top_k, epilogue, mul_routed_weight, situ_beta, situ_linear_beta)
+    gfx942_op("mxfp4_moe_gateup")(A, B, Bs, C, topk_weights, sorted_token_ids, expert_ids,
+                                  num_tokens_post_padded, num_m_blocks, block_m, num_valid_tokens,
+                                  top_k, epilogue, mul_routed_weight, situ_beta, situ_linear_beta)
 
 
 def mxfp4_moe_down(A: torch.Tensor, B: torch.Tensor, Bs: torch.Tensor, C: torch.Tensor,
@@ -231,6 +231,6 @@ def mxfp4_moe_down(A: torch.Tensor, B: torch.Tensor, Bs: torch.Tensor, C: torch.
     At ``nt=2`` the kernel pairs each lane's two results into one dword store,
     which requires an even ``N`` and unit column strides on ``C`` and ``Bs``.
     """
-    _C.mxfp4_moe_down(A, B, Bs, C, topk_weights, sorted_token_ids, expert_ids,
-                      num_tokens_post_padded, num_m_blocks, block_m, n_steps, nt,
-                      num_valid_tokens, top_k, mul_routed_weight)
+    gfx942_op("mxfp4_moe_down")(A, B, Bs, C, topk_weights, sorted_token_ids, expert_ids,
+                                num_tokens_post_padded, num_m_blocks, block_m, n_steps, nt,
+                                num_valid_tokens, top_k, mul_routed_weight)

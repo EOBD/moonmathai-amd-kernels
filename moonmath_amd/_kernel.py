@@ -1,14 +1,8 @@
-"""Wrapper that calls the compiled _C extension, with CPU fallback support."""
+"""Wrapper that calls the gfx942 extension module, with CPU fallback support."""
 
 import torch
 
-try:
-    import moonmath_amd._C as _C
-except ImportError as e:
-    raise ImportError(
-        "moonmath_amd: failed to import _C extension. "
-        "Build with: pip install -e . --no-build-isolation (requires ROCm PyTorch + hipcc)"
-    ) from e
+from ._arch import gfx942_op
 
 
 def forward(
@@ -37,7 +31,7 @@ def forward(
     Returns:
         torch.bfloat16 tensor of the same shape and device as the inputs.
     """
-    # Type and basic validation (before device check)
+    # Type/basic checks, ahead of the device check
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not isinstance(t, torch.Tensor):
             raise TypeError(f"{name} must be torch.Tensor; got {type(t).__name__}")
@@ -48,33 +42,33 @@ def forward(
                 f"{name} must be 4-D ({layout.upper()}); got shape={tuple(t.shape)}"
             )
 
-    # CPU fallback: move to GPU, call _C, move result back
+    # CPU fallback: stage on GPU, run, copy the result back
     if q.device.type == "cpu":
-        # Ensure k, v are also on CPU
+        # Require k and v on CPU too
         if k.device.type != "cpu" or v.device.type != "cpu":
             raise ValueError(
                 "q is on CPU but k or v is not; all must be on the same device"
             )
 
-        # Move to first available CUDA device
+        # Stage everything on the first CUDA device
         device = torch.device("cuda:0")
         q_gpu = q.to(device)
         k_gpu = k.to(device)
         v_gpu = v.to(device)
         out_gpu = out.to(device) if out is not None else None
 
-        result_gpu = _C.forward(q_gpu, k_gpu, v_gpu, out_gpu, round_mode, layout)
+        result_gpu = gfx942_op("forward")(q_gpu, k_gpu, v_gpu, out_gpu, round_mode, layout)
         return result_gpu.cpu()
 
-    # GPU path: call _C directly
+    # GPU path: run directly
     elif q.device.type in ("cuda", "hip"):
-        # Validate k, v on same device
+        # Require k and v on q's device
         if k.device != q.device or v.device != q.device:
             raise ValueError(
                 f"q/k/v must be on the same device; got q={q.device}, k={k.device}, v={v.device}"
             )
 
-        return _C.forward(q, k, v, out, round_mode, layout)
+        return gfx942_op("forward")(q, k, v, out, round_mode, layout)
 
     else:
         raise NotImplementedError(
@@ -118,8 +112,8 @@ def forward_lite(
     Note: The lite kernel symbol does not exist in the current attention_kernel.hip.
     This will raise a NotImplementedError until the kernel is added.
     """
-    # Currently raises an error from _C.forward_lite
-    return _C.forward_lite(
+    # Not implemented yet: the module's forward_lite raises for now
+    return gfx942_op("forward_lite")(
         q,
         k,
         v,

@@ -21,7 +21,7 @@ rank-local partial plus its base-2 LSE, and ``mla_dcp_lse_merge_ranks`` combines
 the ranks' (partial, lse) pairs after the DCP all-to-all.
 """
 import torch
-import moonmath_amd._C as _C
+from ._arch import gfx942_op
 
 __all__ = [
     "mla_decode_a16w8",
@@ -66,7 +66,7 @@ def mla_decode_a16w8(
     cp_rank:    this rank's index, 0 <= cp_rank < cp_world.
     cp_world:   the DCP world size; 1 is plain decode.
     """
-    _C.mla_decode_a16w8(
+    gfx942_op("mla_decode_a16w8")(
         q_lat, q_pe, kv_pool, o_lat, seq_lens, kv_indices, kv_indptr,
         float(scale), float(kv_scale), lse, glen, int(cp_rank), int(cp_world),
     )
@@ -89,4 +89,4 @@ def mla_dcp_lse_merge_ranks(
     out:      [T, HL, 512] bf16 — merged output (written in-place).
     lse_out:  [T, HL] fp32 or None — the merged base-2 log-sum-exp.
     """
-    _C.mla_dcp_lse_merge_ranks(parts_in, lse_in, out, lse_out)
+    gfx942_op("mla_dcp_lse_merge_ranks")(parts_in, lse_in, out, lse_out)
