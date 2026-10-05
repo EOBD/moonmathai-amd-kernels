@@ -2,7 +2,8 @@
 
 Hand-tuned kernels for AMD CDNA3 (MI300X / gfx942): a bf16 MHA forward kernel, an
 MLA (DeepSeek-V3) absorbed-decode kernel, and the grouped GEMMs of an MXFP4
-mixture-of-experts layer.
+mixture-of-experts layer. And for AMD CDNA4 (MI355X / gfx950): a bf16 attention
+forward kernel, [details below](#cdna4-mi355x--gfx950).
 
 **MHA forward** — 8-wave warp-specialized CTA: each wave owns 3 q-tiles (48 q-rows),
 two parked in registers, the third staged through LDS; K streams HBM→LDS by direct
@@ -33,8 +34,8 @@ bf16 activations. [Details below](#mxfp4-moe-gemms).
 Requires ROCm with `hipcc` on PATH.
 
 ```sh
-pip install -e .                              # GPU_ARCHS=native: targets that rocminfo lists
-GPU_ARCHS=gfx942 pip install -e .             # explicit targets, e.g. for a GPU-less build machine
+pip install -e .                              # GPU_ARCHS=native picks the GPUs rocminfo reports
+GPU_ARCHS="gfx942;gfx950" pip install -e .    # or an explicit list, e.g. on a GPU-less build machine
 ```
 
 As in AITER, `GPU_ARCHS` picks the targets (`CDNA3_ARCH` still works when it is unset). Each
@@ -42,6 +43,7 @@ arch folder in `csrc/` is its own extension module, compiled for that arch only:
 
 - `moonmath_amd._C_gfx942` — the MHA kernel in all three bf16 rounding modes (RTNA, RTNE, RTZ),
   the MLA decode kernel and the MXFP4 MoE GEMMs.
+- `moonmath_amd._C_gfx950` — the CDNA4 attention kernels.
 
 Ops pick the module of the GPU they run on at call time, and say so when this build or this GPU
 has no kernels for them.
@@ -54,20 +56,20 @@ has no kernels for them.
 import torch
 import moonmath_amd as ma
 
-# diffusion-style BSHD tensors, so no transpose is needed
+# BSHD tensors as used by diffusion: no transpose required
 q = torch.randn(2, 8192, 24, 128, dtype=torch.bfloat16, device="cuda")
 k = torch.randn(2, 8192, 24, 128, dtype=torch.bfloat16, device="cuda")
 v = torch.randn(2, 8192, 24, 128, dtype=torch.bfloat16, device="cuda")
 
-out      = ma.forward(q, k, v, layout="bshd")                    # RTNA rounding is the default
+out      = ma.forward(q, k, v, layout="bshd")                    # gfx942 defaults to RTNA rounding
 out_rtna = ma.forward(q, k, v, layout="bshd", round_mode="rtna")
 out_rtz  = ma.forward(q, k, v, layout="bshd", round_mode="rtz")
 
-# classic BHSD behaves identically (it is the default layout)
+# classic BHSD behaves identically (and is the default layout)
 qh = q.transpose(1, 2).contiguous()
 out_h = ma.forward(qh, qh, qh)
 
-# cross-attention: any KV length, zero padding
+# cross-attention: arbitrary KV length, no padding needed
 ctx = torch.randn(2, 512, 24, 128, dtype=torch.bfloat16, device="cuda")
 out_x = ma.forward(q, ctx, ctx, layout="bshd")
 ```
@@ -89,11 +91,11 @@ import moonmath_amd as ma
 B, H, S, LAT, ROPE = 8, 16, 8192, 512, 64
 scale, kv_scale = (LAT + ROPE) ** -0.5, 1.0 / 32.0
 pool = (torch.randn(B * S, 1, LAT + ROPE, device="cuda") / kv_scale).to(torch.float8_e4m3fnuz)
-kv_indices = torch.arange(B * S, dtype=torch.int32, device="cuda")  # page_size 1, so any permutation works
+kv_indices = torch.arange(B * S, dtype=torch.int32, device="cuda")  # page_size 1; slots in any order
 kv_indptr = torch.arange(B + 1, dtype=torch.int32, device="cuda") * S
 seq_lens = torch.full((B,), S, dtype=torch.int32, device="cuda")
 
-# q_len 1 is plain decode; q_len 4 is a draft window where position t sees KV [0, S - q_len + t].
+# q_len 1 is plain decode; q_len 4 is a draft window, position t attending KV [0, S - q_len + t].
 for q_len in (1, 4):
     q_lat = torch.randn(B * q_len, H, LAT, dtype=torch.bfloat16, device="cuda")
     q_pe = torch.randn(B * q_len, H, ROPE, dtype=torch.bfloat16, device="cuda")
@@ -110,16 +112,89 @@ ma.mla_decode_a16w8(q_lat, q_pe, pool, o_lat, seq_lens, kv_indices, kv_indptr, s
 ma.mla_dcp_lse_merge_ranks(parts_in, lse_in, out, lse_out)
 ```
 
+## CDNA4 (MI355X / gfx950)
+
+bf16 attention forward: head dim 128, and MLA prefill (Q/K 192, V 128). Dense or causal, GQA,
+any sequence lengths, as a batch or as packed variable-length sequences. 8-wave CTAs of
+16x16x32 MFMAs stream K and V through LDS by DMA; a host planner splits KV across CUs when
+the grid would leave them idle. Same `ma.forward`, plus `ma.forward_varlen` in
+`flash_attn_varlen_func`'s argument order and `ma.forward_paged` for K/V in pages (AITER's
+`mha_batch_prefill_func` page lists, or vLLM block tables).
+
+The kernels index every tensor at its own batch, token and head strides, so any view whose
+head dim is contiguous (`stride(-1) == 1`) goes in as is: BSHD or BHSD, slices of a longer
+sequence or a larger head set, padded rows, a fused QKV projection, and each of q, k, v and
+`out` in its own memory order. Nothing is transposed or copied; `layout` only says which of
+dims 1 and 2 is the sequence.
+
+```python
+q = torch.randn(2, 4096, 32, 128, dtype=torch.bfloat16, device="cuda")   # shape [B, S, H, D]
+k = torch.randn(2, 4096, 8, 128, dtype=torch.bfloat16, device="cuda")    # 8 KV heads, i.e. GQA
+v = torch.randn(2, 4096, 8, 128, dtype=torch.bfloat16, device="cuda")
+out = ma.forward(q, k, v, layout="bshd", causal=True)   # RTNE rounding, softmax_scale = 1/sqrt(D)
+
+# same data viewed as [B, H, S, D] (the default layout): identical bits, no copies
+out_h = ma.forward(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True)
+
+# a fused projection [B, S, 32 + 8 + 8, 128]: q, k, v are slices into it
+qkv = torch.randn(2, 4096, 48, 128, dtype=torch.bfloat16, device="cuda")
+out = ma.forward(qkv[:, :, :32], qkv[:, :, 32:40], qkv[:, :, 40:], layout="bshd", causal=True)
+
+# packed sequences of 1000, 47, 3049 tokens: [total_tokens, H, D] with int32 cu_seqlens
+qp, kp, vp = q[0], k[0], v[0]
+cu = torch.tensor([0, 1000, 1047, 4096], dtype=torch.int32, device="cuda")
+out = ma.forward_varlen(qp, kp, vp, cu, cu, 3049, 3049, causal=True)
+
+# optionally also each row's log-sum-exp: fp32 [B, H, S] (varlen: [H, total_tokens]), matching AITER
+out, lse = ma.forward(q, k, v, layout="bshd", causal=True, return_lse=True)
+
+# plan once per forward pass, then run it for each layer
+plan = ma.VarlenPlan().plan(cu, cu, 3049, 3049, 4096, 4096, heads=32, kv_heads=8, causal=True)
+out = plan.run(qp, kp, vp)
+
+# K/V in 16-token pages: caches [pages, 16, kv_heads, D] with SGLang / AITER page lists
+k_cache = torch.randn(512, 16, 8, 128, dtype=torch.bfloat16, device="cuda")
+v_cache = torch.randn(512, 16, 8, 128, dtype=torch.bfloat16, device="cuda")
+pages = torch.randperm(512, device="cuda")[:257].int()   # pages per sequence: 63 + 3 + 191
+out = ma.forward_paged(qp, k_cache, v_cache, cu.cpu(), torch.tensor([1000, 47, 3049], dtype=torch.int32),
+                       kv_indptr=torch.tensor([0, 63, 66, 257], dtype=torch.int32), kv_page_indices=pages,
+                       causal=True)
+```
+
+All run on the current stream and are CUDA-graph capturable. `cu_seqlens` on the GPU are
+planned on the GPU: no host sync, and a graph replay reads their current contents. On the host
+(CPU tensors), or with CPU copies passed as `host_cu_seqlens_q/_k`, an eager call plans exactly
+on the host instead (it can split KV over idle CUs).
+
+`ma.VarlenPlan` splits `forward_varlen` in two: `plan()` takes the sequences and the shapes once
+per forward pass, `run(q, k, v)` then launches only the attention kernels, for each layer. Plan
+and runs go in the same graph capture or none; keep the plan alive while a graph using it replays.
+
 ## Constraints
 
-### MHA forward
+### MHA forward, gfx942
 
 - bf16 inputs / bf16 outputs.
 - `head_dim == 128`.
 - Any `seq_len ≥ 1` for Q and K/V independently (cross-attention supported);
   out-of-range rows are handled by hardware buffer bounds, not padding.
-- No causal mask, no GQA, no varlen batching.
-- gfx942 / MI300X only (CDNA3).
+- No causal mask, no GQA, no varlen batching; `softmax_scale` fixed at `1/sqrt(128)`.
+
+### Attention forward, gfx950
+
+- bf16 inputs / bf16 outputs, rounded RTNE (`round_mode="rtne"`, the only mode).
+- Head dims (Q/K, V) of (128, 128) or (192, 128).
+- `ma.forward`: BHSD (`layout="bhsd"`, the default on every arch) or BSHD (`layout="bshd"`);
+  `ma.forward_varlen`: THD (`[total_tokens, H, D]`).
+- Any strides with a contiguous head dim (`stride(-1) == 1`), tokens at most 2^22 elements
+  apart. A new output is contiguous in the call's layout.
+- Q heads a multiple of K/V heads (MHA, GQA, MQA).
+- Any lengths ≥ 0, Sq ≠ Skv; causal is bottom-right aligned, and a row that sees no key is 0.
+- `forward_varlen`: `max_seqlen_q/k` must bound every sequence (checked when the lengths are on
+  the host); rows outside every sequence are not written.
+- `forward_paged`: page sizes a power of two, at least 8 (head dim 128) or 16 (MLA); head dim
+  128 needs K and V caches with the same strides. Lengths and `kv_indptr` are read on the host
+  (CPU tensors avoid a sync), so it is not graph capturable; the page list stays on the GPU.
 
 ### MLA decode
 
@@ -158,7 +233,7 @@ shards of the expert width; at any other K `mxfp4_moe_down_block_m` returns 0 an
 the down projection runs on the gate/up kernel with `EPI_NONE`.
 
 ```python
-w13 = ma.repack_mxfp4(w13_raw)          # do this once, at weight-load time
+w13 = ma.repack_mxfp4(w13_raw)          # do this once, when loading weights
 w13s = ma.repack_mxfp4_scales(w13s_raw)
 
 bm = ma.mxfp4_moe_gateup_block_m(rows, num_active_experts)
@@ -197,10 +272,10 @@ per expert, so most of each tile is padding and only the 16-row tile is competit
 Reproduce with:
 
 ```sh
-python benchmark/bench_moe.py --markdown            # reproduces the table above
-python benchmark/bench_moe.py --tokens 8 512 2048   # other token counts
-python benchmark/bench_moe.py --layout ep8          # an expert-parallel geometry
-python benchmark/bench_moe.py --show-tiles          # all AITER tiles, not only the winner
+python benchmark/bench_moe.py --markdown            # reproduce the table above
+python benchmark/bench_moe.py --tokens 8 512 2048   # any other token count
+python benchmark/bench_moe.py --layout ep8          # expert-parallel layout
+python benchmark/bench_moe.py --show-tiles          # list all AITER tiles, not only the best
 ```
 
 The bench needs AITER on the path for the Triton baseline
@@ -212,6 +287,9 @@ both kernels against a dense reference that never sees the repacked weights.
 - `csrc/gfx942/attention_kernel.hip` — the MHA kernel (attention + V pre-transpose).
 - `csrc/gfx942/mla_decode_a16w8.hip` — MLA absorbed decode, any q_len, optional DCP.
 - `csrc/gfx942/mxfp4_moe_gateup.hip`, `csrc/gfx942/mxfp4_moe_down.hip` — the MoE GEMMs.
+- `csrc/gfx950/attention.hip`, `csrc/gfx950/attention_mla.hip` — the CDNA4 attention kernels (head dim
+  128, MLA 192/128); `attention_plan.hpp` is their host planner, `attention.h` their C API,
+  `opus/` their vendored opus.
 - `csrc/<arch>/*_api.cpp` — the torch bindings for each.
 - `moonmath_amd/` — Python package; `_arch.py` picks the module of the live GPU.
 - `Makefile` — direct kernel build (`make` produces root-level `.so` variants).
@@ -224,6 +302,12 @@ both kernels against a dense reference that never sees the repacked weights.
   split, DCP ranks, the cross-rank merge, CUDA-graph replay and the domain rejections.
 - `tests/test_moe.py` — the MoE GEMMs against a dense reference built from the
   dequantized stock weights, plus the repack, tile-shape and domain contracts.
+- `tests/test_attention_gfx950.py` — the CDNA4 kernels against an fp64 reference: dense and
+  causal, GQA, off-grid and zero lengths, varlen, varlen == batch bit for bit, BHSD, strided
+  views and head-major varlen == their contiguous copies bit for bit, streams and graphs,
+  LSE, GPU `cu_seqlens` and `VarlenPlan` (no host sync, graph replays with new lengths,
+  == the host-planned path), paged K/V == varlen bit for bit (page sizes 8-64, page lists and
+  block tables), and the input rejections. The CDNA3 tests skip on other GPUs, and so does this one.
 
 ## Bench
 
@@ -289,8 +373,8 @@ Against Modular MAX we are 1.37–1.59× faster everywhere.
 Reproduce with:
 
 ```sh
-# --no-max yields the cleanest ours-vs-AITER numbers (MAX's runtime perturbs co-located timings);
-# omit it to also measure Modular MAX.
+# --no-max keeps the ours/AITER numbers cleanest (MAX runtime perturbs co-located timings);
+# omit it to measure Modular MAX as well.
 python bench_table.py --benchmark-iters 30 --warmup-iters 8 --passes 5 --no-max
 ```
 
@@ -300,11 +384,11 @@ python bench_table.py --benchmark-iters 30 --warmup-iters 8 --passes 5 --no-max
 git clone https://github.com/moonmath-ai/cdna3-attention.git
 cd cdna3-attention
 
-# python env (ninja is required for the AITER JIT and our kernel build)
+# python env (ninja is needed for AITER's JIT and our kernel build)
 conda create -n cdna3 python=3.11 ninja -y
 conda activate cdna3
 
-# install the package and bench deps (torch, amd-aiter, numpy; max optional)
+# install the package plus bench deps (torch, amd-aiter, numpy; max optional)
 pip install -e '.[bench]'
 
 # --- alternatively, with uv ---
@@ -312,7 +396,7 @@ uv venv --python 3.11
 source .venv/bin/activate
 uv pip install -e '.[bench]'
 
-# run. The first AITER call JIT-builds fmha modules (~50s, then cached under ~/.aiter/).
+# run it. The first AITER call JIT-builds its fmha modules (~50s, cached afterwards in ~/.aiter/).
 python benchmark/runner.py --warmup-iters 8 --benchmark-iters 30
 ```
 
@@ -357,8 +441,8 @@ Reproduce with:
 # Set AITER_PATH to a checkout if it is not already on sys.path.
 python benchmark/bench_mla.py
 
-python benchmark/bench_mla.py --shapes 8:150000,16:150000   # pick specific shapes
-python benchmark/bench_mla.py -v                            # display the num_kv_splits sweep
+python benchmark/bench_mla.py --shapes 8:150000,16:150000   # choose shapes
+python benchmark/bench_mla.py -v                            # print the num_kv_splits sweep
 ```
 
 The script validates both kernels against a chunked fp32 streaming-softmax reference

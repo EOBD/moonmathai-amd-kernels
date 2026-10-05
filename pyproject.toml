@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "moonmath-amd"
 version = "0.1.0"
-description = "Hand-tuned kernels for AMD CDNA3 (MI300X): MHA forward, MLA decode, MXFP4 MoE."
+description = "Hand-tuned kernels for AMD CDNA3 (MI300X: MHA forward, MLA decode, MXFP4 MoE) and CDNA4 (MI355X: bf16 attention forward, varlen, causal, GQA, MLA prefill)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -43,11 +43,11 @@ url = "https://download.pytorch.org/whl/rocm7.2"
 
 
 # Building needs ROCm PyTorch 2.x and hipcc on PATH.
-# torch lives in [build-system].requires so the package builds under isolation
-# (uv resolves it from the pytorch-rocm72 index):
+# torch appears in [build-system].requires so the package builds under
+# build isolation (uv resolves it from the pytorch-rocm72 index):
 #   uv pip install -e .
-# Pass --no-build-isolation to reuse an already-installed torch instead of
-# re-downloading it into the isolated build env:
+# To reuse an installed torch and avoid re-downloading it into the isolated
+# build env, pass --no-build-isolation:
 #   uv pip install -e . --no-build-isolation
-# GPU_ARCHS selects which kernels to build: "native" (default; the GPUs
-# rocminfo reports) or an explicit list, e.g. GPU_ARCHS=gfx942 uv pip install -e .
+# GPU_ARCHS selects which kernels get built: "native" (default: the GPUs rocminfo lists)
+# or an explicit list, e.g. GPU_ARCHS="gfx942;gfx950" uv pip install -e .
