@@ -429,6 +429,8 @@ namespace host {
 //          favor the simpler plan.
 //   fill   Parts fill k rounds one round at a time: the q block with the longest parts gains one more,
 //          provided the CTAs fit and it can accept one (at most MaxParts, one tile each).
+//   align  In a grid of AlignRounds or more rounds, an n-way split cuts at multiples of the longest n-way
+//          part w if every last part keeps w / 2: a head's parts then run in step, sharing K/V tiles in L2.
 //   time   The dispatch, modelled: CTAs longest first, each on the CU that frees first. A CTA costs its KV
 //          tiles (for a 32-row wave: Kernels::q2_tile_cost) plus CtaTiles, a part PartTiles instead, and
 //          each part costs MergeTiles of merge, spread across all CUs (fitted on GRBM cycles).
@@ -448,6 +450,7 @@ constexpr double MergeTiles   = 8;
 constexpr double LptBytes     = 12 << 20;  // combined L2 of 3 XCDs
 constexpr int MaxLptUnits     = 8;
 constexpr int DevSplitRounds  = 4;
+constexpr int AlignRounds     = 3;
 
 // ---- host: the problem --------------------------------------------------------------------------
 // A sequence in batch b: Q/O tokens q0 .. q0 + sq - 1 and K/V tokens kv0 .. kv0 + skv - 1.
@@ -560,8 +563,23 @@ inline PerBlock plan_split(Problem& p, int n_cu, bool allow_split)
 struct Cta { int unit, seq, head0, block, lo, len, part, parts, slot; };      // slot: -1, or its partials'
 
 // One unit at a time, each unit's q blocks from last to first; a split q block's parts are consecutive.
-inline std::vector<Cta> list_ctas(const Problem& p, const PerBlock& tiles, const PerBlock& parts)
+inline std::vector<Cta> list_ctas(const Problem& p, const PerBlock& tiles, const PerBlock& parts, int n_cu)
 {
+    // 1. Per part count n, the longest part and the fewest tiles (see align); then each part's first tile.
+    std::vector<int> width(MaxParts + 1), fewest(MaxParts + 1, INT_MAX);
+    long long ctas = 0;
+    for (size_t s = 0; s < tiles.size(); ++s)
+        for (size_t b = 0; b < tiles[s].size(); ++b) {
+            const int n = parts[s][b], t = tiles[s][b];
+            width[n] = std::max(width[n], ceil_div(t, n)), fewest[n] = std::min(fewest[n], t);
+            ctas += n * (p.H / p.pack);
+        }
+    auto lo = [&](int j, int n, int t) {
+        const bool align = ctas >= (long long)AlignRounds * n_cu && 2 * fewest[n] >= (2 * n - 1) * width[n];
+        return align ? std::min(j * width[n], t) : part_lo(j, n, t);
+    };
+
+    // 2. The CTAs.
     std::vector<Cta> list;
     int units = 0, slots = 0;
     for (int s = 0; s < (int)tiles.size(); ++s)
@@ -569,7 +587,7 @@ inline std::vector<Cta> list_ctas(const Problem& p, const PerBlock& tiles, const
             for (int b = (int)tiles[s].size() - 1; b >= 0; --b) {
                 const int n = parts[s][b], t = tiles[s][b];
                 for (int j = 0; j < n; ++j)
-                    list.push_back({units, s, h, b, part_lo(j, n, t), part_len(j, n, t), j, n,
+                    list.push_back({units, s, h, b, lo(j, n, t), lo(j + 1, n, t) - lo(j, n, t), j, n,
                                     n > 1 ? slots + j : -1});
                 if (n > 1) slots += n;
             }
@@ -641,7 +659,7 @@ inline Plan plan(Problem p, int n_cu, bool allow_split = true)
     auto empty = [](const Seq& s) { return s.sq == 0; };
     p.seqs.erase(std::remove_if(p.seqs.begin(), p.seqs.end(), empty), p.seqs.end());
     const PerBlock parts = plan_split(p, n_cu, allow_split);
-    const std::vector<Cta> order = launch_order(p, list_ctas(p, all_tiles(p), parts));
+    const std::vector<Cta> order = launch_order(p, list_ctas(p, all_tiles(p), parts, n_cu));
 
     // 2. Build the items.
     auto item = [&](const Cta& c) {

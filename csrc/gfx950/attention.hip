@@ -25,13 +25,14 @@ constexpr int DMTiles = HeadDim / 16;              // PV M-tile count
 // wave. A tile buffer consists of 16 slabs of 512 elements, 2 filled by each wave's DMA. One slab holds
 // 8 (K) or 4 (V) kv rows in a row, so a wave's DMA covers rows 8w .. 8w + 7 of a tile (a single page
 // when paged).
-//   K tile [d/64][kv/8][kv%8][d%64/8 ^ kv%8/4][d%8]    V tile [kv/4][d/16][kv%4][d%16]
+//   K tile [d/64][kv/8][d%64/16][kv%8][d%16/8 ^ kv%8/4][d%8]    V tile [kv/4][d/16][kv%4][d%16]
 //   Q slot [q][d/8%8][d/64][d%8]
-// Pitches and the K swizzle render the reads conflict-free: a half-wave's 16-B chunks stay distinct mod 512 B.
+// Pitches and the K swizzle render the reads conflict-free: LDS has 64 banks, and each 16-lane pass of
+// a read touches distinct 16-B chunks mod 256 B (measured: SQ_LDS_BANK_CONFLICT 0).
 constexpr int SlabsPerTile    = KvTile * HeadDim / SlabElems;
 constexpr int DmaInstsPerTile = SlabsPerTile / NumWaves;
 constexpr int BlockDmas = 2 * DmaInstsPerTile;     // K and V DMA instructions issued per wave, per block
-constexpr int KPitch = SlabElems + 8, KHalf = 8 * KPitch + 224;    // K slabs; one half at d/64 = 1
+constexpr int KPitch = SlabElems + 32, KHalf = 8 * KPitch;         // K slabs; one half at d/64 = 1
 constexpr int VPitch = SlabElems + 64;
 constexpr int TileBufs = 3;
 constexpr int KBufElems = 2 * KHalf, VBufElems = SlabsPerTile * VPitch;
@@ -42,10 +43,11 @@ constexpr int v_buf(int t) { return (unsigned)t % TileBufs * VBufElems; }
 constexpr int QPitch = HeadDim + 16, QSlotElems = 16 * QPitch;   // row padding keeps reads conflict-free
 constexpr int LdsElems = KRegion + VRegion + NumWaves * QSlotElems;
 static_assert(LdsElems * (int)sizeof(bf16_t) <= 163840, "gfx950 allows 160 KB");
-constexpr auto KTileStride = opus::make_tuple(opus::number<KHalf>{}, opus::number<KPitch>{}, 64_I, 8_I, 1_I);
+constexpr auto KTileStride =
+    opus::make_tuple(opus::number<KHalf>{}, opus::number<KPitch>{}, 128_I, 16_I, 8_I, 1_I);
 constexpr auto VTileStride = opus::make_tuple(opus::number<VPitch>{}, 64_I, 16_I, 1_I);
 constexpr auto QSlotStride = opus::make_tuple(opus::number<QPitch>{}, 16_I, 8_I, 1_I);
-// Position of a K row's 8-element chunk c within d%64 (the swizzle).
+// Position of a K row's 8-element chunk c within d%16 (the swizzle).
 __device__ constexpr int k_chunk(int c, int kv) { return c ^ (kv % 8 / 4); }
 constexpr int OPitch = HeadDim + 8;                // O staging (borrows the K/V region)
 static_assert(NumWaves * MaxWaveRows * OPitch <= LdsElems, "O staging must fit");
@@ -112,11 +114,11 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     // ==== K/V DMA =================================================================================
     // DMA instruction i of wave w fills K slab (d/64 = i, kv/8 = w) and V slab kv/4 = 2w + i within a
     // tile; lane L writes the slab's 16 B at offset 16L, sourced from the wave's rows 8w .. 8w + 7:
-    //   K [kv][d] at [L/8][i, k_chunk(L%8, L/8), 8]        V [kv][d] at [i, L%8/2][L/8, L%2, 8]
+    //   K [kv][d] at [L%16/2][i, L/16, k_chunk(L%2, L%16/2), 8]    V [kv][d] at [i, L%8/2][L/8, L%2, 8]
     // A row corresponds to a token, whose byte stride never exceeds 8 MB (host::valid_strides).
     const uint32_t k_row_bytes = a.k_str.token * sizeof(bf16_t), v_row_bytes = a.v_str.token * sizeof(bf16_t);
-    const auto k_src = lane_view<xdim<P<8>>, xdim<Y<2>, P<8>, Y<8>>>(
-        opus::make_tuple(k_row_bytes, 2_I), lane / 8, k_chunk(lane % 8, lane / 8));
+    const auto k_src = lane_view<xdim<P<8>>, xdim<Y<2>, P<4>, P<2>, Y<8>>>(
+        opus::make_tuple(k_row_bytes, 2_I), lane % 16 / 2, lane / 16, k_chunk(lane % 2, lane % 16 / 2));
     const auto v_src = lane_view<xdim<Y<2>, P<4>>, xdim<P<8>, P<2>, Y<8>>>(
         opus::make_tuple(v_row_bytes, 2_I), lane % 8 / 2, lane / 8, lane % 2);
 
@@ -312,9 +314,10 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
 
     // ==== LDS reads ===============================================================================
     // K fragment (kt, ks), QK's A operand, rows l and columns 8g .. 8g+7: within the K tile
-    // [d/64][kv/8][kv%8][d%64/8 ^ kv%8/4][d%8] it sits at [g%2][kt/2, l/8, kt%2][l%8][ks, k_chunk(g/2, l)][8].
+    // [d/64][kv/8][d%64/16][kv%8][d%16/8 ^ kv%8/4][d%8] it sits at
+    // [g%2][kt/2, l/8, kt%2][ks][l%8][k_chunk(g/2, l)][8].
     const auto k_read =
-        lane_view<xdim<P<2>>, xdim<Y<2>, P<2>, Y<2>>, xdim<P<8>>, xdim<Y<4>, P<2>>, xdim<Y<8>>>(
+        lane_view<xdim<P<2>>, xdim<Y<2>, P<2>, Y<2>>, xdim<Y<4>>, xdim<P<8>>, xdim<P<2>>, xdim<Y<8>>>(
             KTileStride, g % 2, l / 8, l % 8, k_chunk(g / 2, l));
     // V^T fragment (ks, dt), PV's A operand: two ds_read_b64_tr_b16 calls (h = 0, 1) on V tile
     // [kv/4][d/16][kv%4][d%16] at [ks, g/2, h, g%2][dt][l/4][l%4, 4]; lane l receives column d = 16dt + l.
