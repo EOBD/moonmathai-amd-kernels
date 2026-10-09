@@ -13,8 +13,8 @@
 // contiguous in the call's layout. (Dqk, Dv) is (128, 128) or (192, 128) (MLA prefill); GQA when
 // H % HKv == 0; causal is bottom-right aligned. lse (optional) is each q row's fp32 natural-log
 // log-sum-exp in AITER's layout, -inf for a row that sees no key. Everything runs on the current torch
-// stream and refuses any device but gfx950. The kernels' C API lives in attention.h (head dim 128
-// entries take D = 128; the MLA entries none).
+// stream and rejects any device but gfx950. The kernels' C API lives in attention.h (head-dim-128 entries
+// take D = 128; the MLA entries have none).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -116,7 +116,7 @@ void check_heads(const std::string& who, int64_t H, int64_t HKv, const char* q_h
             std::to_string(HKv) + ")");
 }
 
-// q, k, v: bf16 `dim`-D tensors on a single gfx950 GPU, heads in dim h, valid head dims. Returns whether it is MLA.
+// q, k and v: bf16 `dim`-D tensors on one gfx950 GPU, heads in dim h, valid head dims. Returns whether it is MLA.
 bool check_qkv(const std::string& who, const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, int dim, int h) {
   check_tensor(who, q, "q", dim, q);
   require_gfx950(who, q.device());
@@ -171,7 +171,7 @@ Outputs outputs(
   return o;
 }
 
-// Tokens lie at most 2^22 elements apart: the kernels' token strides are 32-bit (attention_plan.hpp MaxToken).
+// Tokens lie at most 2^22 elements apart; token strides are 32-bit in the kernels (attention_plan.hpp MaxToken).
 constexpr int64_t MaxTokenStride = int64_t(1) << 22;
 
 // The C entries' leading arguments: tensor data pointers and their strides (attention.h).
@@ -179,7 +179,7 @@ struct Tensors {
   const void *q, *k, *v;
   void* o;
   float* lse;
-  std::array<int64_t, 15> strides;  // batch, token and head strides for q, k, v, out, then lse's
+  std::array<int64_t, 15> strides;  // batch, token and head strides for q, k, v and out, then lse's
 };
 
 // q, k, v and out with strides: q and out use dims d, k and v use kv_d, lse uses lse_d.
@@ -209,7 +209,7 @@ Tensors tensors(
   return t;
 }
 
-// 0: queued; -1: the kernels rejected the arguments; otherwise a hipError_t.
+// 0: queued; -1: the kernels rejected their arguments; otherwise a hipError_t.
 void check_rc(const std::string& who, int rc) {
   if (rc == -1) fail(who, "the kernel rejected its arguments");
   if (rc != 0) throw std::runtime_error(who + ": launch failed: " + hipGetErrorString((hipError_t)rc));
@@ -236,8 +236,8 @@ void check_cu_tensor(const std::string& who, const at::Tensor& cu, const char* n
     fail(who, std::string(name) + " must be in host memory or on " + device.str() + ", got " + cu.device().str());
 }
 
-// Host values must be non-decreasing, within [0, tokens], and no longer than max_len per sequence
-// (max_seqlen sizes a device plan).
+// Host values must be non-decreasing, within [0, tokens] and no longer than max_len per sequence (max_seqlen
+// sizes a device plan).
 void check_cu_values(const std::string& who, const at::Tensor& cu, const char* name, int64_t tokens, int max_len) {
   const std::string n = name;
   const int* c = cu.data_ptr<int>();
@@ -475,8 +475,8 @@ bool capturing(int device) {
   return s != hipStreamCaptureStatusNone;
 }
 
-// Closed handles wait here while their device is capturing a graph, since freeing device memory would
-// break the capture. Each close destroys the waiting handles whose device has stopped capturing.
+// Closed handles wait here while their device captures a graph, since freeing device memory would break the
+// capture. Each close destroys the waiting handles whose device has stopped capturing.
 std::mutex closed_mutex;
 std::vector<std::pair<void*, int>> closed_handles;  // {handle, device}
 
@@ -580,7 +580,7 @@ class VarlenPlan {
     return {o.out, o.lse};
   }
 
-  // Frees the handle once its kernels finish (or later, if a capture is running). Re-planning creates a new one.
+  // Frees the handle once its kernels finish (or later, while a capture runs). Re-planning creates a new one.
   void close() {
     if (handle_) destroy_when_safe(handle_, device_);
     handle_ = nullptr, planned_ = false;

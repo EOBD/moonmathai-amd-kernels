@@ -1,9 +1,7 @@
-// How the work is divided and launched; shared by attention.hip (head dim 128) and attention_mla.hip
-// (MLA: Q/K 192, V 128). Their C API lives in attention.h.
-// Device side: the work list (one WorkItem per CTA), a wave's rows and KV tiles (wave_work), K/V
-// resources and pages, and merge_parts, which joins a split q block's partials. Host side (namespace
-// host): plan -> list -> launch, planned from host lengths or built on the GPU from device cu_seqlens
-// (list_varlen); lists are cached per stream and safe under graph capture; the C API's checks come last.
+// Work division and launch for the attention kernels (C API: attention.h).
+// Device: the work list (one WorkItem per CTA), a wave's rows and KV tiles (wave_work), K/V resources and pages,
+// merge_parts (joins a split q block's partials) and list_varlen (the list from device cu_seqlens).
+// Host (namespace host): plan -> list -> launch; lists cached per stream, graph-capture safe; C API checks.
 #pragma once
 
 #include "attention_prims.hpp"
@@ -26,62 +24,54 @@ namespace attn {
 __host__ __device__ constexpr int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
 // ---- tensors ------------------------------------------------------------------------------------
-// Every tensor is [batch][token][head][d] with its own batch, token and head strides (d contiguous):
-// BSHD, BHSD, packed THD (single batch), or any such view. Sequence i's q rows are the Q/O tokens q0 ..
-// q0 + sq - 1 of batch b and its keys the K/V tokens kv0 .. kv0 + skv - 1: a batch call has one
-// sequence per batch (q0 = kv0 = 0), while a varlen call packs its sequences into batch 0. Causal masks
-// are aligned to the bottom right. Strides are in elements, never negative, token stride 32-bit
-// (host::valid_strides).
+// Every tensor is [batch][token][head][d] with its own strides in elements (d contiguous; BSHD, BHSD, THD).
+// A sequence holds Q/O tokens q0 .. q0 + sq - 1 and K/V tokens kv0 .. kv0 + skv - 1 of batch b; batch calls have
+// one per batch (q0 = kv0 = 0), varlen calls pack them all in batch 0. Causal is bottom-right aligned.
 struct Strides { int64_t batch, token, head; };
 
-// Element offset of batch b's given token and head.
+// Element offset of token `token`, head `head`, batch `b`.
 __device__ __forceinline__ uint64_t offset(const Strides& s, uint32_t b, uint32_t token, uint32_t head)
 {
     return b * (uint64_t)s.batch + token * (uint64_t)(uint32_t)s.token + head * (uint64_t)s.head;
 }
 
 // ---- the CTA work list --------------------------------------------------------------------------
-// The work of a single CTA: a q block of one sequence and head pack (see rows), either whole or one part
-// of its KV tiles (KV split). fwd<false> reads the first 9 ints and fwd<true> the slot as well. A merge
-// item is part 0 of a split q block, carrying num_parts. An item with sq = 0 is empty, so fwd and
-// merge_parts return immediately.
+// A CTA's work: a q block of one sequence and head pack (see rows), whole or one part of its KV tiles.
+// A merge item is part 0 of a split q block with num_parts; sq = 0 marks an empty item.
 struct WorkItem {
-    int q0, sq;                     // its sequence's first Q/O token, and how many q rows it has
-    int kv0, skv;                   // the sequence's first K/V token, and its key count
+    int q0, sq;                     // the sequence's first Q/O token and q row count
+    int kv0, skv;                   // the sequence's first K/V token and key count
     int chunk0;                     // first chunk of the q block (see rows)
-    int tile_lo, tile_hi;           // the range of KV tiles it walks
+    int tile_lo, tile_hi;           // its KV tiles
     int head0;                      // first q head of the head pack
-    int b;                          // batch of its sequence
-    int slot;                       // -1: a whole q block that stores O; else the slot of its fp32 partials
-    int num_parts;                  // merge items only: the q block's part count, slots slot, slot + 1, ...
+    int b;                          // the sequence's batch
+    int slot;                       // -1: a whole q block (stores O); else the slot of its fp32 partials
+    int num_parts;                  // merge items: the part count (slots slot, slot + 1, ...)
 };
 static_assert(offsetof(WorkItem, slot) == 9 * sizeof(int), "fwd<false> reads the first 9 ints");
 
-// The parts of a split q block occupy consecutive slots, each BlockM rows of partials.
+// A split q block's parts take consecutive slots of BlockM partial rows.
 struct Args {
     const bf16_t* __restrict__ q;   // [batch][token][H][Dqk]  (see tensors)
     const bf16_t* __restrict__ k;   // [batch][token][HKv][Dqk]
     const bf16_t* __restrict__ v;   // [batch][token][HKv][Dv]
     bf16_t* __restrict__ o;         // [batch][token][H][Dv]
     Strides q_str, k_str, v_str, o_str;
-    const WorkItem* __restrict__ work;   // one item for each CTA
+    const WorkItem* __restrict__ work;   // one item per CTA
     float* part_o;                  // [slot][BlockM][Dv]: a part's unnormalised O
     float2* part_ml;                // [slot][BlockM]: per-row frame m and row sum l
     int H, HKv, grp, pack, causal;  // grp = H / HKv; pack: q heads per head pack (1, or grp)
     float scale_log2e;              // softmax_scale * log2(e)
-    float* __restrict__ lse;        // nullptr, or [batch][token][H] at lse_str: each q row's row_lse
+    float* __restrict__ lse;        // nullptr, or [batch][token][H] at lse_str, each q row's lse
     Strides lse_str;
     const int* page_table;          // paged calls (see paged K/V): table_len entries, pages of 2^page_shift
     int table_len, page_shift;
 };
 
 // ---- rows ---------------------------------------------------------------------------------------
-// A wave handles one chunk: `rows` (the launch's wave rows, 48 or 32) consecutive q rows of a single q
-// head; 8 chunks form a q block, which is a CTA's work. A head pack groups the q heads whose chunks
-// share q blocks: one head, or under causal GQA every head of a KV head. A head's chunks are aligned to
-// the sequence's end, so chunk 0 can begin before q = 0; a pack interleaves its heads with the head
-// fastest (chunk c: q chunk c / pack of head c % pack). Q blocks align to the end as well: q block 0
-// gets the empty chunks (c < 0), the lightest under causal.
+// A chunk is a wave's `rows` (48 or 32) consecutive q rows of one head; 8 chunks make a q block (a CTA's work).
+// A head pack is the heads sharing q blocks (one, or all of a KV head under causal GQA); chunk c is q chunk
+// c / pack of head c % pack. Chunks and q blocks align to the sequence's end: q block 0 gets the empty ones.
 __host__ __device__ inline int head_chunks(int sq, int rows) { return ceil_div(sq, rows); }
 __host__ __device__ inline int chunk_q0(int c, int sq, int pack, int rows)
 {
@@ -105,7 +95,7 @@ __host__ __device__ inline int block_tiles(int sq, int skv, int b, int pack, int
     return ceil_div(max(kv_end, 0), KvTile);
 }
 
-// Part j out of n of a q block owning t tiles: tiles j t / n .. (j + 1) t / n - 1.
+// Part j of n of t tiles: tiles j t / n .. (j + 1) t / n - 1.
 __host__ __device__ inline int part_lo(int j, int n, int t) { return j * t / n; }
 __host__ __device__ inline int part_len(int j, int n, int t) { return (j + 1) * t / n - j * t / n; }
 
@@ -121,30 +111,29 @@ __device__ __forceinline__ ChunkRows chunk_rows(const Args& a, const WorkItem& i
 // ---- the work of one wave -----------------------------------------------------------------------
 struct WaveWork {
     int head, kv_head;
-    int b;                    // batch of its sequence
-    int q0, sq;               // its sequence's first Q/O token, and its q row count
+    int b;                    // the sequence's batch
+    int q0, sq;               // the sequence's first Q/O token and q row count
     int kv_len, kv_shift;     // the sequence's keys; causal: row q's last key is q + kv_shift
     size_t kv_row0;           // first tile's K/V token
-    int row0;                 // q of its first row: `rows` rows from here (-rows: all padding)
+    int row0;                 // q of its first row (-rows: all padding)
     int tile_lo, num_tiles;   // its KV tiles tile_lo .. tile_lo + num_tiles - 1
-    int num_unmasked;         // tiles from here on require a mask
-    int num_live;             // tiles from here on mask every row: the wave only joins the DMA
+    int num_unmasked;         // tiles from here on need a mask
+    int num_live;             // tiles from here on mask every row: DMA only
     int slot;                 // -1, or the slot of its partials
 };
 template <bool Split>
 __device__ __forceinline__ WaveWork wave_work(const Args& a, int wave, int rows)
 {
-    // 1. The CTA's work item; a split launch's slot and partials are taken here, not in the loops [lgkm].
+    // 1. The CTA's work item; a split launch's slot and partials loaded here, not in the loops [lgkm].
     const WorkItem it = a.work[blockIdx.x];
     if constexpr (Split) pin_scalar(it.slot), pin_scalar(a.part_o), pin_scalar(a.part_ml);
 
-    // 2. This wave's chunk. head and row0 live in SGPRs: VALU divisions at this point spill the loop.
+    // 2. This wave's chunk; head and row0 in SGPRs.
     const ChunkRows c = chunk_rows(a, it, wave, rows);
     const int head = __builtin_amdgcn_readfirstlane(c.head);
     const int row0 = __builtin_amdgcn_readfirstlane(c.row0);
 
-    // 3. Masks: the sequence's last key and, under causal, the diagonals of the wave's first row
-    // (unmasked) and last row (live). First over the sequence's tiles, then the part's (from tile_lo).
+    // 3. Masks: the last key and, under causal, the diagonals of the first row (unmasked) and last row (live).
     const int num_tiles = it.tile_hi - it.tile_lo, kv_shift = it.skv - it.sq;
     int num_unmasked = it.skv / KvTile;
     if (a.causal) num_unmasked = min(num_unmasked, (row0 + kv_shift + 1) / KvTile);
@@ -158,8 +147,7 @@ __device__ __forceinline__ WaveWork wave_work(const Args& a, int wave, int rows)
             num_tiles, max(0, num_unmasked - it.tile_lo), num_live, Split ? it.slot : -1};
 }
 
-// The wave's rows: its head's row q = 0 in Q or O, its KV head's row kv_row0 in K or V. Their row r sits
-// r token strides further on.
+// The wave's q = 0 row of Q or O, and its kv_row0 row of K or V; row_at advances r token strides.
 template <class T>
 __device__ __forceinline__ T* qo_rows(T* x, const Strides& s, const WaveWork& w)
 {
@@ -175,8 +163,8 @@ __device__ __forceinline__ T* row_at(T* rows, const Strides& s, uint32_t r)
     return rows + (size_t)r * (uint32_t)s.token;
 }
 
-// A K/V buffer resource starting at row `row` of x's `rows` rows: its range stops after the last row's
-// d_bytes (capped at 4 GB), so later rows read as 0 and a token stride under d does not matter.
+// A K/V buffer resource from row `row` of x's `rows`: its range ends after the last row's d_bytes (at most
+// 4 GB), so later rows read 0.
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t kv_rsrc_at(const bf16_t* x, size_t row, size_t rows,
                                                             uint32_t row_bytes, uint32_t d_bytes)
 {
@@ -184,7 +172,7 @@ __device__ __forceinline__ __amdgpu_buffer_rsrc_t kv_rsrc_at(const bf16_t* x, si
     const size_t bytes = left > 0 ? (left - 1) * row_bytes + d_bytes : 0;
     return opus::make_buffer_rsrc((const char*)x + row * row_bytes, (uint32_t)min(bytes, (size_t)UINT32_MAX));
 }
-// That same resource expressed as words (for D128 its loop schedule measured 0.3% faster this way).
+// The same resource as words.
 __device__ __forceinline__ rsrc_t kv_rsrc_words(const bf16_t* x, size_t row, size_t rows, uint32_t row_bytes,
                                                 uint32_t d_bytes)
 {
@@ -196,12 +184,10 @@ __device__ __forceinline__ rsrc_t kv_rsrc_words(const bf16_t* x, size_t row, siz
 }
 
 // ---- paged K/V ----------------------------------------------------------------------------------
-// In a paged call K and V are pools of pages, with k_str.batch and v_str.batch as the page strides. Key r
-// of a sequence is virtual token kv0 + r: row (kv0 + r) % page size of page page_table[(kv0 + r) >>
-// page_shift].
+// K and V are page pools (page stride: k_str.batch, v_str.batch). Key r is virtual token vk = kv0 + r, at row
+// vk % page size of page page_table[vk >> page_shift].
 
-// The page stored at byte `entry` of the table, plus the wait for it. In asm, while the compiler has a
-// scalar load in flight every one of its LDS waits is lgkmcnt(0) [lgkm].
+// The page at byte `entry` of the table, and the wait for it; asm [lgkm].
 __device__ __forceinline__ int load_page(const int* table, uint32_t entry)
 {
     int page;
@@ -212,31 +198,27 @@ __device__ __forceinline__ void wait_page(int& page)
 {
     asm volatile("s_waitcnt lgkmcnt(0)" : "+s"(page));
 }
-// The table byte of the page holding virtual token vk, with vk clamped to the sequence's last key
-// (kv_last): rows beyond it read nothing, and the table stops there.
+// The table byte of virtual token vk's page, vk clamped to the last key (the table ends there).
 __device__ __forceinline__ uint32_t page_entry(uint32_t vk, uint32_t kv_last, int shift)
 {
     return min(vk, kv_last) >> shift << 2;
 }
 
 // ---- row outputs and merging --------------------------------------------------------------------
-// The scale applied to a q row's O: 1 / l, 0 when there are no keys (l = 0), NaN when its scores were not
-// finite (the kernels' mask_nonfinite turns l into NaN).
+// A q row's O scale: 1 / l; 0 with no keys (l = 0); NaN for non-finite scores.
 __device__ __forceinline__ float inv_row_sum(float l, bool nan_row)
 {
     return nan_row ? opaque_nan() : l > 0.0f ? __builtin_amdgcn_rcpf(l) : 0.0f;
 }
 
-// A q row's log-sum-exp, matching aiter: ln sum exp(softmax_scale q.k) across its keys, from frame m
-// (log2 units) and row sum l. -inf with no keys (l = 0), NaN when its scores were not finite. Because l
-// adds up the bf16 P that O uses, it stays within ln(1 + 2^-8) of the exact LSE.
+// A q row's LSE as aiter's, ln sum exp(softmax_scale q.k), from frame m (log2 units) and row sum l;
+// -inf with no keys, NaN for non-finite scores. l sums the bf16 P: within ln(1 + 2^-8) of exact.
 __device__ __forceinline__ float row_lse(float m, float l, bool nan_row)
 {
     return nan_row ? opaque_nan() : l > 0.0f ? (m + __builtin_amdgcn_logf(l)) / Log2e : opaque_neg_inf();
 }
 
-// A wave's LSEs: its head's at q = 0 (nullptr when the call requests none) and their token stride. Pinned
-// at creation, otherwise the loops' SGPRs get renumbered.
+// A wave's LSEs: its head's at q = 0 (nullptr: none requested) and their token stride; pinned SGPRs.
 struct LseRows { float* rows; uint32_t token; };
 __device__ __forceinline__ LseRows lse_rows(const Args& a, const WaveWork& w)
 {
@@ -251,15 +233,14 @@ __device__ __forceinline__ void store_lse(const LseRows& r, const WaveWork& w, i
         r.rows[(size_t)(unsigned)q * r.token] = row_lse(m, l, nan_or_plus_inf(maybe_nan(l)));
 }
 
-// Merge a q row's fp32 partials in part order: M = max m, w = exp2(m - M),
-// O = sum w o / sum w l, and the LSE from M and sum w l. A merge item's q block uses merge_ctas CTAs in
-// grid y, with each thread owning 8 d of a row.
+// Merge a q row's fp32 partials in part order: M = max m, w = exp2(m - M), O = sum w o / sum w l, LSE from
+// M and sum w l. A merge item takes merge_ctas CTAs in grid y; a thread owns 8 d of a row.
 constexpr int MergeThreads = 256;
 constexpr int merge_ctas(int d, int rows) { return NumWaves * rows * (d / 8) / MergeThreads; }
 template <int D, int Rows>
 __global__ __launch_bounds__(MergeThreads) void merge_parts(Args a)
 {
-    // 1. Row r of the q block handled by this thread; rows outside the sequence produce no output.
+    // 1. This thread's row r of the q block; none past the sequence.
     constexpr int ThreadsPerRow = D / 8;
     const WorkItem it = a.work[blockIdx.x];
     const int r = blockIdx.y * (MergeThreads / ThreadsPerRow) + threadIdx.x / ThreadsPerRow;
@@ -268,8 +249,7 @@ __global__ __launch_bounds__(MergeThreads) void merge_parts(Args a)
     const int q = c.row0 + r % Rows;
     if ((unsigned)q >= (unsigned)it.sq) return;
 
-    // 2. M. Parts whose row has no key (l = 0) hold an arbitrary frame and contribute nothing. Any part
-    // with l = NaN (non-finite scores) forces the whole row to NaN.
+    // 2. M over parts with keys (l > 0); a part with l = NaN makes the row NaN.
     const size_t row0 = (size_t)it.slot * BlockM + r;      // part p sits at row0 + p BlockM
     float m_max = NegInf;
     bool nan_row = false;
@@ -279,7 +259,7 @@ __global__ __launch_bounds__(MergeThreads) void merge_parts(Args a)
         nan_row |= nan_or_plus_inf(maybe_nan(ml.y));
     }
 
-    // 3. Sum the weighted partials into O.
+    // 3. O from the weighted partials.
     float l = 0.0f;
     f32x4_t lo{}, hi{};
     for (int p = 0; p < it.num_parts; ++p) {
@@ -309,14 +289,12 @@ __global__ void copy_list(T* dst, const T* src, int n)
 }
 
 // ---- device varlen: building the list on the GPU ------------------------------------------------
-// When cu_seqlens lives on the GPU (dev mode), list_varlen assembles a call's CTAs there. Every q block
-// runs in min(P, its tiles) parts (P comes from the host, 1 meaning whole), heaviest parts first (a
-// counting sort on part length), with a q block's CTAs kept together (head pack, then part); remaining
-// list entries are empty items. Part k of a split q block gets slot = its item index; the merge items of
-// its head packs come after the list's cap items. A sequence's tokens are clamped to the tensors' and its
-// q rows to max_q (the first q blocks of a longer sequence are left uncomputed), so nothing reads out of
-// bounds whatever cu_seqlens contains. Only the list's order is nondeterministic, not the results.
-constexpr int ListThreads = 1024;               // a single CTA, one thread per bucket
+// Dev mode (cu_seqlens on the GPU). Each q block runs in min(P, its tiles) parts (P from the host), heaviest
+// first (counting sort on part length), a q block's CTAs together (head pack, then part); the rest is empty.
+// A split part's slot is its item index; merge items follow the list's cap items. Tokens are clamped to the
+// tensors' and q rows to max_q (a longer sequence's first q blocks are skipped), so any cu_seqlens stays in
+// bounds. Only the list order is nondeterministic.
+constexpr int ListThreads = 1024;               // one CTA, one thread per bucket
 struct ListArgs {
     const int* cu_q;                            // sequence s: Q/O tokens cu_q[s] .. cu_q[s + 1] - 1 (device)
     const int* cu_k;                            // and K/V tokens cu_k[s] .. cu_k[s + 1] - 1
@@ -331,14 +309,14 @@ struct ListArgs {
 template <int Threads>
 __global__ __launch_bounds__(Threads) void list_varlen(ListArgs a)
 {
-    __shared__ int first[Threads];              // per bucket, heaviest first: its items, then its next slot
+    __shared__ int first[Threads];              // per bucket: its item count, then its first slot
     __shared__ int merges;
     const int t = threadIdx.x, lane = t % WaveSize;
-    const int block_items = a.parts * a.packs;                        // most items a q block can have
-    const int seq_blocks = num_q_blocks(a.max_q, a.pack, a.rows);     // max q blocks a sequence can have
+    const int block_items = a.parts * a.packs;                        // max items per q block
+    const int seq_blocks = num_q_blocks(a.max_q, a.pack, a.rows);     // max q blocks per sequence
     const int num_blocks = a.n * seq_blocks;
-    auto block = [&](int v) {                   // q block v % seq_blocks of sequence v / seq_blocks,
-        if (v >= num_blocks) return WorkItem{}; // counted from its end and whole; else sq = 0
+    auto block = [&](int v) {                   // q block v % seq_blocks (from the end) of sequence
+        if (v >= num_blocks) return WorkItem{}; // v / seq_blocks; an empty item beyond the last q block
         const int s = v / seq_blocks, q0 = min(max(a.cu_q[s], 0), a.total_q);
         const int kv0 = min(max(a.cu_k[s], 0), a.total_k);
         const int sq = min(a.cu_q[s + 1], a.total_q) - q0, skv = max(min(a.cu_k[s + 1], a.total_k) - kv0, 0);
@@ -352,7 +330,7 @@ __global__ __launch_bounds__(Threads) void list_varlen(ListArgs a)
         return Threads - 1 - min(ceil_div(it.tile_hi, it.num_parts) >> a.shift, Threads - 1);
     };
 
-    // 1. Count items per bucket, then an exclusive scan to get each bucket's first slot.
+    // 1. Items per bucket, then an exclusive scan: each bucket's first slot.
     first[t] = 0;
     if (t == 0) merges = 0;
     __syncthreads();
@@ -375,17 +353,15 @@ __global__ __launch_bounds__(Threads) void list_varlen(ListArgs a)
     first[t] = sum - own;
     __syncthreads();
 
-    // 2. Each lane's q block claims its slots in its bucket; the wave then stores its q blocks' items,
-    // item e (lane j's head pack h, part `part`) coming from lane e % WaveSize, since a store engages
-    // every lane of the wave, active or not. A split q block's merge items go after the list (one lane
-    // each: only a few).
+    // 2. Each lane's q block claims slots in its bucket; the wave stores the items, item e (lane j's head pack
+    // h, part `part`) by lane e % WaveSize. Merge items go after the list, one lane each.
     for (int v0 = t / WaveSize; v0 < num_blocks; v0 += Threads) {    // lane i handles wave v0 + i
         WorkItem it = block(v0 + lane * (Threads / WaveSize));
         const int lanes = WaveSize - __clzll(__ballot(it.sq > 0));    // through the last lane with a q block
         if (lanes == 0) continue;
         const int n = it.num_parts * a.packs;
         const int to = it.sq > 0 ? atomicAdd(&first[bucket(it)], n) : a.cap;
-        for (int e0 = 0; e0 < lanes * block_items; e0 += WaveSize) {  // uniform: shfl only reads active lanes
+        for (int e0 = 0; e0 < lanes * block_items; e0 += WaveSize) {  // uniform: shfl reads active lanes only
             const int e = e0 + lane, j = e / block_items % WaveSize;
             const int h = e % block_items / a.parts, part = e % a.parts;
             const int np = max(__shfl(it.num_parts, j), 1), start = __shfl(to, j), at = start + h * np + part;
@@ -393,7 +369,7 @@ __global__ __launch_bounds__(Threads) void list_varlen(ListArgs a)
             if (a.parts > 1) lo = part_lo(part, np, hi), hi = lo + part_len(part, np, hi);
             const WorkItem x{__shfl(it.q0, j), __shfl(it.sq, j), __shfl(it.kv0, j), __shfl(it.skv, j),
                              __shfl(it.chunk0, j), lo, hi, h * a.pack, 0, np > 1 ? at : -1, np};
-            const bool fits = start + np * a.packs <= a.cap;         // otherwise cu broke its bounds: empty items
+            const bool fits = start + np * a.packs <= a.cap;         // else cu_seqlens is out of bounds: empty
             if (e < lanes * block_items && part < np && at < a.cap) a.list[at] = fits ? x : WorkItem{};
         }
         if (it.num_parts > 1 && to + n <= a.cap) {
@@ -403,7 +379,7 @@ __global__ __launch_bounds__(Threads) void list_varlen(ListArgs a)
         }
     }
 
-    // 3. Leave the unused items empty.
+    // 3. Empty the unused items.
     __syncthreads();
     for (int i = min(total, a.cap) + t; i < a.cap; i += Threads) a.list[i] = WorkItem{};
     for (int i = merges + t; i < a.cap_merges; i += Threads) a.list[a.cap + i] = WorkItem{};
@@ -411,35 +387,26 @@ __global__ __launch_bounds__(Threads) void list_varlen(ListArgs a)
 
 namespace host {
 
-// The host pipeline: plan -> list -> launch, with one fwd launch and then a merge launch if any q block
-// splits.
-//   host mode  Lengths live on the host (batch, or varlen with host cu_seqlens): the planner chooses wave
-//              rows, the KV split and the CTA order; the list is staged to the device and cached per stream.
-//   dev mode   cu_seqlens lives on the GPU: the host derives wave rows and parts P from max lengths and
-//              totals, and list_varlen builds the CTAs on the GPU, so there is no host sync.
-//   plan / run A varlen call is planned once per forward pass and run by every layer (via a plan handle).
+// plan -> list -> launch: one fwd launch, then a merge launch if any q block splits.
+//   host mode  Host lengths: the planner picks wave rows, KV split and CTA order; the list is cached per stream.
+//   dev mode   Device cu_seqlens: wave rows and parts P from max lengths and totals; list_varlen builds the
+//              list on the GPU (no host sync).
+//   plan / run A varlen call planned once per forward pass, run by every layer.
 
 // ---- host: the planner --------------------------------------------------------------------------
-// The GPU hands CTAs round-robin to its 8 XCDs, each owning its own L2; an XCD launches its CTAs in list
-// order, each on whichever CU frees first. One round means one CTA per CU. A unit is one sequence's head
-// pack: its CTAs all read a single KV head. The rules:
-//   split  A grid of at most SplitMaxRounds rounds takes the fastest of its q blocks whole, or split into
-//          parts that fill k = 1 .. SplitMaxRounds rounds; first with 48-row waves, then 32 (more CTAs,
-//          each cheaper). A later candidate has to beat the current one by SplitMinGain, so near-ties
-//          favor the simpler plan.
-//   fill   Parts fill k rounds one round at a time: the q block with the longest parts gains one more,
-//          provided the CTAs fit and it can accept one (at most MaxParts, one tile each).
-//   align  In a grid of AlignRounds or more rounds, an n-way split cuts at multiples of the longest n-way
-//          part w if every last part keeps w / 2: a head's parts then run in step, sharing K/V tiles in L2.
-//   time   The dispatch, modelled: CTAs longest first, each on the CU that frees first. A CTA costs its KV
-//          tiles (for a 32-row wave: Kernels::q2_tile_cost) plus CtaTiles, a part PartTiles instead, and
-//          each part costs MergeTiles of merge, spread across all CUs (fitted on GRBM cycles).
-//   order  CTAs run longest first. When the list's eighths carry equal work, XCD x takes the x-th eighth
-//          so its L2 serves few KV heads: batched into groups of at least the units whose K/V fits LptBytes
-//          (at most MaxLptUnits), with a split grid kept in a single group. Otherwise the entire list goes
-//          round-robin.
-//   dev    Dev mode: wave rows and parts P per q block follow split's rule, for a stand-in call; P > 1
-//          only when the list then fills at most DevSplitRounds rounds, which bounds the workspace.
+// CTAs go round-robin to the 8 XCDs (one L2 each); an XCD starts its CTAs in list order on the first free CU.
+// A round: one CTA per CU. A unit: one sequence's head pack (one KV head). The rules:
+//   split  A grid of at most SplitMaxRounds rounds takes the fastest of: q blocks whole, or split to fill
+//          k = 1 .. SplitMaxRounds rounds; 48-row waves, then 32. A later candidate must win by SplitMinGain.
+//   fill   Per round, the q block with the longest parts gains a part (at most MaxParts, one tile each).
+//   align  At AlignRounds or more rounds, an n-way split cuts at multiples of the longest part w if every
+//          last part keeps w / 2: a head's parts run in step and share K/V in L2.
+//   time   Modelled dispatch, longest first on the first free CU. A CTA costs its KV tiles (fewer wave rows:
+//          q2_tile_cost) plus CtaTiles (a part: PartTiles); a part adds MergeTiles of merge over all CUs.
+//   order  Longest first. If the list's eighths carry equal work, XCD x takes eighth x, in groups of the
+//          units whose K/V fits LptBytes (at most MaxLptUnits; a split grid is one group); else round-robin.
+//   dev    Dev mode: wave rows and P by split's rule on a stand-in call; P > 1 only within DevSplitRounds
+//          rounds (bounds the workspace).
 constexpr int NumXcd          = 8;
 constexpr int SplitMaxRounds  = 8;
 constexpr double SplitMinGain = 1.05;
@@ -459,9 +426,9 @@ struct Seq { int b, q0, sq, kv0, skv; };
 struct Problem {
     std::vector<Seq> seqs;
     int H, HKv, causal;
-    int pack;                       // number of q heads per head pack
-    int kv_bytes;                   // K + V bytes per key for one KV head
-    float q2_tile_cost = 1.0f;      // a 32-row wave's KV tile, measured in 48-row tiles
+    int pack;                       // q heads per head pack
+    int kv_bytes;                   // K + V bytes per key of one KV head
+    float q2_tile_cost = 1.0f;      // a KV tile of the fewer wave rows, in tiles of the more
     int rows = MaxWaveRows;         // wave rows, chosen by plan_split
 };
 
@@ -479,7 +446,7 @@ inline PerBlock all_tiles(const Problem& p)
 }
 
 // ---- host: 1. wave rows and KV split -----------------------------------------------------------
-// A grid's modelled time: the dispatch of its CTAs, then the merge; beyond `limit` only a lower bound.
+// A grid's modelled time: CTA dispatch, then the merge; past `limit` only a lower bound.
 inline double modelled_time(const Problem& p, const PerBlock& tiles, const PerBlock& parts, int n_cu,
                             double limit)
 {
@@ -497,11 +464,11 @@ inline double modelled_time(const Problem& p, const PerBlock& tiles, const PerBl
             if (n > 1) merge += MergeTiles * n * packs / n_cu;
         }
     for (auto [cost, n] : ctas) longest = std::max(longest, cost), work += cost * n;
-    const int merge_time = (int)merge;              // rounded down, matching how costs were fitted
+    const int merge_time = (int)merge;              // truncated, as the per-CTA costs are whole units
     double end = std::max(longest, work / n_cu);
     if (end + merge_time > limit) return end + merge_time;
 
-    // 2. While staying within `limit`: longest first, each on the CU that frees first (CU levels).
+    // 2. Within `limit`: longest first, each on the first free CU.
     std::sort(ctas.begin(), ctas.end(), std::greater<>());
     std::vector<std::pair<double, long long>> cu{{0.0, n_cu}};     // levels of (finish time, CUs), a min-heap
     for (auto [cost, n] : ctas)
@@ -519,8 +486,7 @@ inline double modelled_time(const Problem& p, const PerBlock& tiles, const PerBl
 // A grid's wave rows (written into p) and its parts for each q block.
 inline PerBlock plan_split(Problem& p, int n_cu, bool allow_split)
 {
-    // 1. For each choice of wave rows (48, 32): tiles, parts (one per q block), CTAs, and q blocks by
-    // part length.
+    // 1. Per wave rows (more, then fewer): tiles, parts (one per q block), CTAs, q blocks by part length.
     const int packs = p.H / p.pack, rows[2] = {MaxWaveRows, 32};
     PerBlock tiles[2], parts[2];
     long long ctas[2] = {};
@@ -534,8 +500,7 @@ inline PerBlock plan_split(Problem& p, int n_cu, bool allow_split)
             for (size_t b = 0; b < tiles[r][s].size(); ++b) longest[r].push({tiles[r][s][b], (int)s, (int)b});
     }
 
-    // 2. The candidates (see split, fill); when k leaves the parts unchanged since k - 1, the result is
-    // the same and the candidate loses.
+    // 2. The candidates (split, fill); one with parts unchanged since k - 1 is skipped.
     double best_time = 1e300;
     int best = 0;
     PerBlock best_parts;
@@ -544,7 +509,7 @@ inline PerBlock plan_split(Problem& p, int n_cu, bool allow_split)
             const long long before = ctas[r];
             while (ctas[r] + packs <= (long long)k * n_cu && !longest[r].empty()) {
                 const auto [len, s, b] = longest[r].top();
-                if (parts[r][s][b] == std::min(MaxParts, tiles[r][s][b])) break;    // already at its maximum
+                if (parts[r][s][b] == std::min(MaxParts, tiles[r][s][b])) break;    // at its maximum
                 longest[r].pop(), ctas[r] += packs;
                 longest[r].push({(double)tiles[r][s][b] / ++parts[r][s][b], s, b});
             }
@@ -558,14 +523,13 @@ inline PerBlock plan_split(Problem& p, int n_cu, bool allow_split)
 }
 
 // ---- host: 2. ordering the CTAs -----------------------------------------------------------------
-// A CTA: part `part` of `parts`, of q block `block` in a unit (a sequence together with a head pack),
-// spanning len tiles from lo.
+// A CTA: part `part` of `parts` of q block `block` in a unit; len tiles from lo.
 struct Cta { int unit, seq, head0, block, lo, len, part, parts, slot; };      // slot: -1, or its partials'
 
-// One unit at a time, each unit's q blocks from last to first; a split q block's parts are consecutive.
+// Unit by unit, q blocks last to first; a split q block's parts consecutive.
 inline std::vector<Cta> list_ctas(const Problem& p, const PerBlock& tiles, const PerBlock& parts, int n_cu)
 {
-    // 1. Per part count n, the longest part and the fewest tiles (see align); then each part's first tile.
+    // 1. Per part count n, the longest part and fewest tiles (align); then each part's first tile.
     std::vector<int> width(MaxParts + 1), fewest(MaxParts + 1, INT_MAX);
     long long ctas = 0;
     for (size_t s = 0; s < tiles.size(); ++s)
@@ -594,20 +558,20 @@ inline std::vector<Cta> list_ctas(const Problem& p, const PerBlock& tiles, const
     return list;
 }
 
-// Stable, longest CTAs first, by counting (lengths stay small).
+// Longest CTAs first; stable counting sort.
 inline void longest_first(std::vector<Cta>::iterator first, std::vector<Cta>::iterator last)
 {
     const std::vector<Cta> in(first, last);
-    std::vector<int> end;                           // per length: how many CTAs are at least that long
+    std::vector<int> end;                           // per length: CTAs at least that long
     for (const Cta& c : in) end.resize(std::max(end.size(), c.len + size_t(1))), ++end[c.len];
     for (int l = (int)end.size() - 2; l >= 0; --l) end[l] += end[l + 1];
     for (auto c = in.rbegin(); c != in.rend(); ++c) first[--end[c->len]] = *c;
 }
 
-// The CTAs in launch order: CTA i executes item i.
+// The CTAs in launch order: CTA i runs item i.
 inline std::vector<Cta> launch_order(const Problem& p, std::vector<Cta> list)
 {
-    // 1. Test whether the list's eighths carry equal work (KV tiles), within a tile per CTA and 1%.
+    // 1. Whether the list's eighths carry equal KV tiles, within a tile per CTA and 1%.
     const int n = (int)list.size();
     long long lo = LLONG_MAX, hi = 0;
     for (int x = 0; x < NumXcd; ++x) {
@@ -617,8 +581,8 @@ inline std::vector<Cta> launch_order(const Problem& p, std::vector<Cta> list)
     }
     const bool ranges = n > 0 && n % NumXcd == 0 && hi - lo <= n / NumXcd + hi / 100;
 
-    // 2. Longest first: per eighth when equal, in groups of at least `fit` units (a split grid uses one
-    // group), otherwise the whole list.
+    // 2. Longest first: per eighth when equal, in groups of at least `fit` units (split grid: one group);
+    // else the whole list.
     int max_skv = 1;
     for (const Seq& s : p.seqs) max_skv = std::max(max_skv, s.skv);
     const bool split = std::any_of(list.begin(), list.end(), [](const Cta& c) { return c.parts > 1; });
@@ -635,33 +599,32 @@ inline std::vector<Cta> launch_order(const Problem& p, std::vector<Cta> list)
     }
     if (!ranges) return list;
 
-    // 3. XCD x takes eighth x: CTA i is the (i / 8)-th CTA of XCD i % 8, which runs item i / 8 of the
-    // eighth numbered i % 8.
+    // 3. XCD x takes eighth x: CTA i (XCD i % 8) runs item i / 8 of eighth i % 8.
     std::vector<Cta> order(n);
     for (int i = 0; i < n; ++i) order[i] = list[i % NumXcd * (n / NumXcd) + i / NumXcd];
     return order;
 }
 
 // ---- host: 3. building the work list ------------------------------------------------------------
-// A launch of `ctas` CTAs and, when some q block is split, a following merge launch.
+// A launch of `ctas` CTAs, then a merge launch if some q block is split.
 struct Plan {
-    std::vector<WorkItem> list;         // the CTA items in launch order, then one per split q block
+    std::vector<WorkItem> list;         // CTA items in launch order, then one per split q block
     int ctas = 0, merges = 0;
     int rows = MaxWaveRows;             // wave rows
-    int slots = 0;                      // number of partial slots
+    int slots = 0;                      // partial slots
     int parts = 1;                      // dev mode: P
 };
 
-// Build the plan for a call (host mode).
+// A call's plan (host mode).
 inline Plan plan(Problem p, int n_cu, bool allow_split = true)
 {
-    // 1. Choose wave rows and parts, and order the CTAs.
+    // 1. Wave rows and parts, then the CTA order.
     auto empty = [](const Seq& s) { return s.sq == 0; };
     p.seqs.erase(std::remove_if(p.seqs.begin(), p.seqs.end(), empty), p.seqs.end());
     const PerBlock parts = plan_split(p, n_cu, allow_split);
     const std::vector<Cta> order = launch_order(p, list_ctas(p, all_tiles(p), parts, n_cu));
 
-    // 2. Build the items.
+    // 2. The items.
     auto item = [&](const Cta& c) {
         const Seq& s = p.seqs[c.seq];
         return WorkItem{s.q0, s.sq, s.kv0, s.skv, first_chunk(c.block, s.sq, p.pack, p.rows), c.lo,
@@ -678,14 +641,12 @@ inline Plan plan(Problem p, int n_cu, bool allow_split = true)
 }
 
 // ---- host: 4. dev mode --------------------------------------------------------------------------
-// With cu_seqlens on the GPU, each sequence has at most mq q rows and mk keys, while the tensors hold
-// total_q and total_k tokens. For a stand-in call, wave rows and P come from the model's fastest option
-// (split's rule): the longest sequence, and the remainder split evenly. The list's size (Plan's ctas,
-// merges and slots) is the largest q block count these numbers permit, times P; ctas = 0 when too big.
+// Sequences of at most mq q rows and mk keys; tensors of total_q and total_k tokens. Wave rows and P by
+// split's rule on a stand-in call (the longest sequence, the rest even). The list holds the most q blocks
+// these allow, times P; ctas = 0 when too big.
 inline Plan dev_plan(Problem p, int n, int mq, int mk, int total_q, int total_k, int n_cu)
 {
-    // 1. The stand-in call, and the largest q block count the numbers permit: q blocks of at most mq
-    // rows, with chunks and q blocks taken from the totals.
+    // 1. The stand-in call, and the most q blocks mq and the totals allow.
     const int packs = p.H / p.pack;
     p.seqs.assign(1, {0, 0, mq, 0, mk});
     if (n > 1)
@@ -697,7 +658,7 @@ inline Plan dev_plan(Problem p, int n, int mq, int mk, int total_q, int total_k,
                         (p.pack * chunks + (NumWaves - 1LL) * n) / NumWaves);
     };
 
-    // 2. Wave rows and P: the fastest modelled time, a later candidate needing to be SplitMinGain faster.
+    // 2. Wave rows and P: fastest modelled time; a later candidate must win by SplitMinGain.
     int rows = MaxWaveRows, parts = 1;
     double best = 1e300;
     for (int P = 1; P <= MaxParts && max_blocks(MaxWaveRows) * packs <= SplitMaxRounds * n_cu; ++P)
@@ -711,7 +672,7 @@ inline Plan dev_plan(Problem p, int n, int mq, int mk, int total_q, int total_k,
             if (SplitMinGain * time <= best) best = time, rows = r, parts = P;
         }
 
-    // 3. The list: max_blocks q blocks of P parts per head pack, then one merge item each (when P > 1).
+    // 3. The list: max_blocks q blocks of P parts per head pack, then a merge item each (P > 1).
     Plan plan;
     const long long items = max_blocks(rows) * packs;
     if (items * (parts + 1) > INT_MAX / (int)sizeof(WorkItem) ||
@@ -726,22 +687,17 @@ inline Plan dev_plan(Problem p, int n, int mq, int mk, int total_q, int total_k,
 }
 
 // ---- host: cached lists -------------------------------------------------------------------------
-// Every stream caches its last StagingSlots plans and device lists, keyed by the call's head dims, heads
-// and sequences: a model's layers repeat the same call, which then skips both planning and copying. A new
-// list goes into a pinned buffer, copied in stream order by a copy_list kernel (an H2D copy costs ~17 us
-// of GPU time, while kernels reading pinned memory cost ~5 us per call). Each stream also caches a
-// workspace for the partials. No call blocks on the GPU: a stream's lists and workspace are rewritten in
-// stream order, a pinned buffer is recycled once its copy finishes, and nothing is freed until release
-// (hipFree waits for the device). state_mutex protects all host state, and hipStreamPerThread is keyed per
-// host thread (state_key). Under graph capture, a captured call's list is uploaded at capture time and
-// kept (launch_captured); a buffer a graph reads is retained once outgrown. Graphs that share a stream's
-// workspace must not replay concurrently.
+// Each stream caches its last StagingSlots plans and device lists, keyed by head dims, heads and sequences
+// (repeated layer calls skip planning and copying), and a partials workspace. A new list goes through a
+// pinned buffer and a copy_list kernel, in stream order. No call blocks: nothing is freed before release
+// (hipFree waits for the device). state_mutex guards host state; hipStreamPerThread is keyed per thread.
+// Under capture a list is uploaded once and kept (launch_captured). Graphs sharing a stream's workspace
+// must not replay concurrently.
 constexpr int MaxDevices    = 64;
 constexpr int StagingSlots  = 8;
 constexpr int PinnedBuffers = 1024; // per device; when all are busy, a copy waits for the oldest
 
-// A device buffer that only ever grows, at least doubling. An outgrown one is kept until release (a graph
-// may still read it, and freeing would wait for the device).
+// A device buffer that only grows (at least doubling); outgrown ones are kept until release.
 struct Buffer { void* ptr = nullptr; size_t bytes = 0; std::vector<void*> kept; };
 
 struct Staged {
@@ -750,7 +706,7 @@ struct Staged {
     Buffer list;                    // the device list
 };
 
-// A pinned buffer used as a list's copy source; done is recorded after its last copy.
+// A list's pinned copy source; done is recorded after its last copy.
 struct Pinned { WorkItem* ptr = nullptr; size_t cap = 0; hipEvent_t done = nullptr; };
 
 struct StreamState {
@@ -797,9 +753,8 @@ inline unsigned long long capture_id(hipStream_t stream)
 }
 inline bool capturing(hipStream_t stream) { return capture_id(stream) != 0; }
 
-// A pinned buffer for n items, taken from the pool: the oldest whose copy is done (when PinnedBuffers are
-// busy, after waiting on it), otherwise a fresh one. Size is a power of two; an outgrown one is dropped
-// without freeing, since hipHostFree would wait for the device. Returns false if out of memory.
+// A pinned buffer for n items: the pool's oldest once its copy is done (waited for when all PinnedBuffers
+// are busy), else a new one; power-of-two sized, outgrown ones dropped unfreed. False when out of memory.
 inline bool take_pinned(Pinned& p, int dev, size_t n)
 {
     std::deque<Pinned>& pool = pinned[dev];
@@ -830,9 +785,8 @@ inline bool upload(void* to, const std::vector<WorkItem>& list, int dev, hipStre
     return true;
 }
 
-// Device memory allocated on the spot, initialized with init's bytes if given, else nullptr. Works during
-// graph capture as well: relaxed mode permits hipMalloc (no stream work), and the copy runs on its own
-// stream (on the null stream it would be pulled into the capture).
+// Device memory, filled from init if given; nullptr on failure. Capture-safe: relaxed mode allows
+// hipMalloc, and the copy runs on its own stream (not the null stream, which the capture would take).
 inline void* device_alloc(size_t bytes, const void* init = nullptr, int dev = 0)
 {
     void* p = nullptr;
@@ -843,8 +797,8 @@ inline void* device_alloc(size_t bytes, const void* init = nullptr, int dev = 0)
     else if (init && ((!s && hipStreamCreateWithFlags(&s, hipStreamNonBlocking) != hipSuccess) ||
                       hipMemcpyAsync(p, init, bytes, hipMemcpyHostToDevice, s) != hipSuccess ||
                       hipStreamSynchronize(s) != hipSuccess))
-        p = nullptr;                                // leaked, since a free could end the capture
-    if (!p) (void)hipGetLastError();              // otherwise the next launch would report it
+        p = nullptr;                                // leaked: a free could end the capture
+    if (!p) (void)hipGetLastError();              // clear it for the next launch
     (void)hipThreadExchangeStreamCaptureMode(&mode);
     return p;
 }
@@ -860,7 +814,7 @@ inline void* grow(Buffer& b, size_t bytes)
     return b.ptr;
 }
 
-// Free b once its kernels have finished and no graph will replay them (hipFree waits for the device).
+// Free b once its kernels are done and no graph will replay them.
 inline void release(Buffer& b)
 {
     for (void* p : b.kept) (void)hipFree(p);
@@ -887,12 +841,11 @@ inline Staged* stage(StreamState& st, std::vector<int> key, Plan plan, int dev, 
 }
 
 // ---- host: launches -----------------------------------------------------------------------------
-// A head dim's kernels, fwd[QTiles - 2][split]: fwd<Q, false> for plans of whole q blocks and fwd<Q,
-// true> for plans containing parts or calls requesting LSEs; plus the cost of a 32-row wave's KV tile
-// measured in 48-row tiles.
+// A head dim's kernels fwd[r][split] for wave rows 32 and 48 (r = rows / 16 - 2; split: plans with parts
+// or LSEs), and a 32-row wave's KV tile cost in 48-row tiles.
 struct Kernels { void (*fwd[2][2])(Args); float q2_tile_cost; };
 
-// The split workspace: part_o first, then part_ml.
+// The split workspace: part_o first, then part_ml; a part holds BlockM rows.
 template <int Dv>
 size_t workspace_bytes(const Plan& plan)
 {
@@ -918,19 +871,19 @@ int run_plan(Kernels k, Args a, const Plan& plan, const WorkItem* list, void* ws
     return (int)hipGetLastError();
 }
 
-// A call captured in a graph: it is planned anew. Its list is uploaded now, outside the graph, and kept
-// (equal lists are shared); its partials use the stream's workspace. A replay then runs only kernels.
+// A call under graph capture: planned anew, its list uploaded outside the graph and kept (equal lists
+// shared), partials in the stream's workspace; replays run only kernels.
 template <int Dv>
 int launch_captured(Kernels k, Args a, const Problem& p, int dev, StreamState& st, hipStream_t stream)
 {
-    // 1. The plan and its workspace. Without a workspace, the call runs unsplit.
+    // 1. The plan and its workspace (none: unsplit).
     const int n_cu = cu_count(dev);
     Plan plan = host::plan(p, n_cu);
     void* ws = nullptr;
     if (plan.slots > 0 && !(ws = grow(st.ws, workspace_bytes<Dv>(plan))))
         plan = host::plan(p, n_cu, false);
 
-    // 2. Fetch or make the list, then launch the kernels.
+    // 2. The list (cached or new), then the kernels.
     const size_t bytes = plan.list.size() * sizeof(WorkItem);
     std::vector<int> key(bytes / sizeof(int));
     std::memcpy(key.data(), plan.list.data(), bytes);
@@ -947,18 +900,18 @@ Problem problem(Kernels k, int H, int HKv, int causal)
     return {{}, H, HKv, causal, causal ? H / HKv : 1, (Dqk + Dv) * (int)sizeof(bf16_t), k.q2_tile_cost};
 }
 
-// Launch a call (host mode): use the stream's matching slot, or stage a plan right now.
+// Launch a call (host mode) from the stream's matching slot, or a newly staged plan.
 template <int Dqk, int Dv>
 int launch(Kernels k, Args a, const Problem& p, hipStream_t stream)
 {
     const int dev = current_device();
     if (dev < 0) return -1;
-    std::lock_guard<std::mutex> lock(state_mutex);    // held until the kernels have been queued
+    std::lock_guard<std::mutex> lock(state_mutex);    // until the kernels are queued
     const int n_cu = cu_count(dev);
     StreamState& st = streams[dev][state_key(stream)];
     if (capturing(stream)) return launch_captured<Dv>(k, a, p, dev, st, stream);
 
-    // 1. The plan together with its device list.
+    // 1. The plan and its device list.
     std::vector<int> key{Dqk, Dv, p.H, p.HKv, p.causal};
     for (const Seq& s : p.seqs) key.insert(key.end(), {s.b, s.q0, s.sq, s.kv0, s.skv});
     const Staged* s = std::find_if(st.staged, st.staged + StagingSlots,
@@ -966,14 +919,14 @@ int launch(Kernels k, Args a, const Problem& p, hipStream_t stream)
     if (s == st.staged + StagingSlots) s = stage(st, key, host::plan(p, n_cu), dev, stream);
     if (!s) return (int)hipErrorOutOfMemory;
 
-    // 2. The split workspace. Without one, the call runs unsplit using a list staged just for it.
+    // 2. The split workspace (none: unsplit, from a list staged for this call).
     void* ws = nullptr;
     if (s->plan.slots > 0 && !(ws = grow(st.ws, workspace_bytes<Dv>(s->plan)))) {
         s = stage(st, {}, host::plan(p, n_cu, false), dev, stream);
         if (!s) return (int)hipErrorOutOfMemory;
     }
 
-    // 3. Launch the kernels.
+    // 3. The kernels.
     return run_plan<Dv>(k, a, s->plan, (const WorkItem*)s->list.ptr, ws, stream);
 }
 
@@ -987,11 +940,11 @@ int launch_batch(Kernels k, Args a, int B, int Sq, int Skv, hipStream_t stream)
     return launch<Dqk, Dv>(k, a, p, stream);
 }
 
-// Varlen sequences from host arrays: sequence i owns the Q/O tokens cu_q[i] .. cu_q[i + 1] - 1 and the
-// K/V tokens cu_k[i] .. in batch 0. Returns false when they are invalid.
+// Varlen sequences from host arrays: sequence i is Q/O tokens cu_q[i] .. cu_q[i + 1] - 1 and K/V tokens
+// cu_k[i] .. of batch 0. False when invalid.
 inline bool varlen_seqs(Problem& p, const int* cu_q, const int* cu_k, int n)
 {
-    if (!cu_q || !cu_k || n < 0 || cu_q[0] < 0 || cu_k[0] < 0) return false;   // token offsets start at 0 or above
+    if (!cu_q || !cu_k || n < 0 || cu_q[0] < 0 || cu_k[0] < 0) return false;
     for (int i = 0; i < n; ++i) {
         const Seq s{0, cu_q[i], cu_q[i + 1] - cu_q[i], cu_k[i], cu_k[i + 1] - cu_k[i]};
         if (s.sq < 0 || s.skv < 0) return false;
@@ -1011,10 +964,9 @@ int launch_varlen(Kernels k, Args a, const int* cu_q, const int* cu_k, int num_s
 }
 
 // ---- host: varlen plans -------------------------------------------------------------------------
-// A varlen plan (the C API's handle; launch_varlen_dev uses its stream's own): host mode with host copies
-// of cu_seqlens when outside a capture, otherwise dev mode, where list_varlen reads cu_seqlens as they
-// stand at run time (inside a graph, on every replay). A run follows its plan in stream order, within the
-// same graph capture or none. The buffers belong to the plan; any captured by a graph live until release().
+// A varlen plan (the C API's handle): host mode given host cu_seqlens outside a capture, else dev mode
+// (list_varlen reads cu_seqlens at run time, in a graph at every replay). A run follows its plan in stream
+// order, in the same capture or none. The plan owns its buffers until release().
 struct VarlenCall {
     const int *cu_q, *cu_k;                 // device pointers
     const int *host_cu_q, *host_cu_k;       // host copies, or null
@@ -1023,18 +975,18 @@ struct VarlenCall {
 
 struct VarlenPlan {
     int dqk = 0, dv = 0, H = 0, HKv = 0, causal = 0;   // the call's values, reused by its runs
-    bool ready = false;                                // the last plan call worked: a run needs it
-    unsigned long long capture = 0;                    // graph capture it was made in, 0 meaning none
-    Plan plan;                                         // what run_plan launches, using list
+    bool ready = false;                                // the last plan call succeeded
+    unsigned long long capture = 0;                    // its graph capture, 0 for none
+    Plan plan;                                         // what run_plan launches, with list
     const WorkItem* list = nullptr;
     void* ws = nullptr;                                // workspace.ptr when the plan has slots
-    Buffer host_list, dev_list, workspace;             // each mode's list; then the partials
+    Buffer host_list, dev_list, workspace;             // each mode's list; the partials
 };
 
 inline std::map<std::array<int, 11>, Plan> dev_plans;                    // keyed by head dims, heads, counts, CUs
-inline std::unordered_map<hipStream_t, VarlenPlan> stream_plans[MaxDevices];   // the ones launch_varlen_dev makes
+inline std::unordered_map<hipStream_t, VarlenPlan> stream_plans[MaxDevices];   // launch_varlen_dev's
 
-// Plan h for the call c, with state_mutex held.
+// Plan h for call c; state_mutex held.
 template <int Dqk, int Dv>
 int plan_varlen(VarlenPlan& h, Kernels k, int H, int HKv, int causal, const VarlenCall& c, hipStream_t stream)
 {
@@ -1045,7 +997,7 @@ int plan_varlen(VarlenPlan& h, Kernels k, int H, int HKv, int causal, const Varl
     Problem p = problem<Dqk, Dv>(k, H, HKv, causal);
     const int n_cu = cu_count(dev);
 
-    // 1. Host mode: use the planner's plan. Without a workspace, the call runs unsplit.
+    // 1. Host mode: the planner's plan (no workspace: unsplit).
     if (c.host_cu_q && c.host_cu_k && !h.capture) {
         if (!varlen_seqs(p, c.host_cu_q, c.host_cu_k, c.n)) return -1;
         if (H == 0 || c.host_cu_q[c.n] == c.host_cu_q[0]) return 0;
@@ -1058,7 +1010,7 @@ int plan_varlen(VarlenPlan& h, Kernels k, int H, int HKv, int causal, const Varl
         return 0;
     }
 
-    // 2. Dev mode: derive rows and P from the host numbers (cached), then run list_varlen.
+    // 2. Dev mode: rows and P from the host numbers (cached), then list_varlen.
     if (!c.cu_q || !c.cu_k || c.n < 0 || c.max_q < 0 || c.max_k < 0 || c.total_q < 0 || c.total_k < 0)
         return -1;
     if (c.n == 0 || H == 0 || c.max_q == 0 || c.total_q == 0) return 0;
@@ -1082,8 +1034,7 @@ int plan_varlen(VarlenPlan& h, Kernels k, int H, int HKv, int causal, const Varl
     return (int)hipGetLastError();
 }
 
-// Run plan h over tensors a (make_args with h's heads and causal); returns -1 if h was planned for
-// different head dims or under a different graph capture.
+// Run plan h over tensors a; -1 if h was planned for other head dims or capture state.
 template <int Dqk, int Dv>
 int run_varlen(const VarlenPlan& h, Kernels k, const Args& a, hipStream_t stream)
 {
@@ -1091,16 +1042,15 @@ int run_varlen(const VarlenPlan& h, Kernels k, const Args& a, hipStream_t stream
     return run_plan<Dv>(k, a, h.plan, h.list, h.ws, stream);
 }
 
-// Free h's buffers once its kernels have finished and no graph will replay its runs.
+// Free h's buffers once its kernels are done and no graph will replay its runs.
 inline void release(VarlenPlan& h)
 {
     release(h.host_list), release(h.dev_list), release(h.workspace);
     h = {};
 }
 
-// A varlen call using device cu_seqlens, planned and run immediately with the stream's plan. When host
-// lengths are supplied, an eager call goes through launch_varlen (which caches plans); a graph capture
-// ignores them because replays can change cu.
+// A varlen call on device cu_seqlens, planned and run now with the stream's plan. Host lengths, if given,
+// go to launch_varlen outside a capture (replays may change cu).
 template <int Dqk, int Dv>
 int launch_varlen_dev(Kernels k, const Args& a, VarlenCall c, hipStream_t stream)
 {
@@ -1108,7 +1058,7 @@ int launch_varlen_dev(Kernels k, const Args& a, VarlenCall c, hipStream_t stream
         return launch_varlen<Dqk, Dv>(k, a, c.host_cu_q, c.host_cu_k, c.n, stream);
     const int dev = current_device();
     if (dev < 0) return -1;
-    std::lock_guard<std::mutex> lock(state_mutex);    // held until the kernels have been queued
+    std::lock_guard<std::mutex> lock(state_mutex);    // until the kernels are queued
     VarlenPlan& h = stream_plans[dev][state_key(stream)];
     c.host_cu_q = c.host_cu_k = nullptr;
     const int err = plan_varlen<Dqk, Dv>(h, k, a.H, a.HKv, a.causal, c, stream);
@@ -1116,8 +1066,7 @@ int launch_varlen_dev(Kernels k, const Args& a, VarlenCall c, hipStream_t stream
 }
 
 // ---- host: the C API ----------------------------------------------------------------------------
-// The entries of attention.h, for either head dim: cdna4_attn_x and cdna4_attn_mla_x forward to api_x
-// with their kernels. A return of -1 means invalid arguments.
+// attention.h's entries forward to api_x with their kernels; -1: invalid arguments.
 
 // A call's tensors as the C API passes them (see "tensors").
 struct Tensors {
@@ -1127,16 +1076,16 @@ struct Tensors {
     const int64_t* strides;     // q's batch, token and head strides, then k's, v's, o's (and lse's)
 };
 
-// Whether scale is positive and finite, judged from its bits: -ffast-math treats every float as finite.
+// Whether scale is positive and finite, from its bits (-ffast-math assumes finite floats).
 inline bool valid_scale(float scale)
 {
     const volatile float opaque = scale;
     const uint32_t bits = __builtin_bit_cast(uint32_t, (float)opaque);
-    return bits > 0 && bits < 0x7F800000u;         // sign bit clear, nonzero, and below +inf
+    return bits > 0 && bits < 0x7F800000u;         // positive, below +inf
 }
 
-// Tensor strides: never negative, and tokens no more than MaxToken elements apart, so they stay 32-bit in
-// the kernels and a KV tile's bytes fit the DMA's 32-bit offsets with room to spare (kv_rsrc).
+// Strides: non-negative, token strides at most MaxToken elements (32-bit in the kernels; a KV tile's bytes
+// fit the DMA's 32-bit offsets).
 constexpr int64_t MaxToken = 1 << 22;
 inline bool valid_strides(const int64_t* s, bool lse)
 {
@@ -1146,11 +1095,12 @@ inline bool valid_strides(const int64_t* s, bool lse)
     return true;
 }
 
-// Whether a call's scale and strides are valid, plus its heads (for GQA, H must be a multiple of HKv).
+// Valid scale and strides.
 inline bool valid_call(const Tensors& t, float scale)
 {
     return valid_scale(scale) && valid_strides(t.strides, t.lse);
 }
+// Valid heads: H a multiple of HKv (MHA, GQA or MQA).
 inline bool valid_heads(int H, int HKv) { return H >= 0 && HKv > 0 && H % HKv == 0; }
 
 // Contiguous [batch][token][heads][d] tensors (BSHD; THD when Sq = Skv = 0).
@@ -1169,9 +1119,8 @@ inline std::array<int64_t, 12> paged_strides(int page_size, int H, int HKv, int 
     return s;
 }
 
-// A call's Args; the launch fills in work, part_o and part_ml. Causal GQA packs together a KV head's q
-// heads, which share both a partial q block and its diagonals; under dense packing there is nothing to
-// gain and balance suffers.
+// A call's Args (the launch sets work, part_o, part_ml). Causal GQA packs a KV head's q heads (they share
+// partial q blocks and diagonals); dense calls do not pack.
 inline Args make_args(const Tensors& t, int H, int HKv, int causal, float scale)
 {
     auto str = [&](int i) { return Strides{t.strides[3 * i], t.strides[3 * i + 1], t.strides[3 * i + 2]}; };
@@ -1222,23 +1171,20 @@ int api_varlen_run(const void* plan, Kernels k, const Tensors& t, float scale, h
 {
     if (!plan || !valid_call(t, scale)) return -1;
     const VarlenPlan& h = *(const VarlenPlan*)plan;
-    if (!h.ready) return -1;                           // was never planned, or its last plan failed
+    if (!h.ready) return -1;                           // unplanned, or its last plan failed
     return run_varlen<Dqk, Dv>(h, k, make_args(t, h.H, h.HKv, h.causal, scale), stream);
 }
 
 // ---- host: paged K/V ----------------------------------------------------------------------------
-// Sequence i owns Q/O tokens cu_q[i] .. cu_q[i + 1] - 1 and kv_lens[i] keys starting at table entry
-// page_starts[i] (all host arrays). Pages hold page_size tokens, a power of two and at least a wave's DMA
-// rows of a tile (8 for D128, 16 for MLA), which then all live in one page. kv0 = page_starts[i] *
-// page_size (see paged K/V).
+// Sequence i: Q/O tokens cu_q[i] .. cu_q[i + 1] - 1, kv_lens[i] keys from table entry page_starts[i] (host
+// arrays). page_size: a power of two, at least a wave's DMA rows (8 for D128, 16 for MLA).
 template <int Dqk, int Dv>
 int api_paged_fwd(Kernels k, const Tensors& t, const int* cu_q, const int* table, int table_len,
                   const int* page_starts, const int* kv_lens, int n, int page_size, int H, int HKv,
                   int causal, float scale, hipStream_t stream)
 {
-    // 1. Checks: page bytes and a page's row bytes fit 32 bits, rows are at least d long, the K and V
-    // pools match (for D128, V's resource is just K's shifted), table entries are within the table, and
-    // virtual tokens fit 31 bits.
+    // 1. Checks: page and page-row bytes fit 32 bits, rows at least d, K and V pools match (D128 shifts K's
+    // resource for V), entries within the table, virtual tokens within 31 bits.
     const int P = page_size;
     if (n < 0 || !valid_heads(H, HKv) || !valid_call(t, scale) || !cu_q || !page_starts || !kv_lens ||
         !table || table_len < 1 || table_len > INT_MAX / 4 || P < (Dqk == Dv ? 8 : 16) || (P & (P - 1)) ||
@@ -1259,12 +1205,12 @@ int api_paged_fwd(Kernels k, const Tensors& t, const int* cu_q, const int* table
     }
     if (H == 0 || cu_q[n] == cu_q[0]) return 0;
 
-    // 2. Launch it as a varlen call over the pages.
+    // 2. A varlen call over the pages.
     Args a = make_args(t, H, HKv, causal, scale);
     a.page_table = table, a.table_len = table_len;
     while ((1 << a.page_shift) < P) ++a.page_shift;
     return launch<Dqk, Dv>(k, a, p, stream);
 }
 
-}  // closes namespace host
-}  // closes namespace attn
+}  // namespace host
+}  // namespace attn

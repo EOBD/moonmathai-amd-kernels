@@ -1,16 +1,11 @@
-// gfx950 attention forward: bf16 with head dim 128; arbitrary strides, varlen (THD) or paged K/V, dense
-// or causal, GQA, optional LSE. C API in attention.h.
-//
-// One CTA owns 384 q rows belonging to a single sequence and KV head: 8 waves, 2 per SIMD, each holding
-// 48 rows of one q head as three 16-row q tiles for v_mfma_f32_16x16x32_bf16 (or 32 rows in two tiles:
-// QTiles). K and V arrive over DMA, streaming through LDS in 64-row tiles. Per KV tile t a wave executes
-// an MFMA block computing S(t) = Q K(t)^T and O += P(t-1) V(t-1), followed by a softmax
-// P(t) = exp2(S(t) scale - frame). Waves 0-3 (group A) run half a tile in front of waves 4-7 (group B):
-// within a SIMD, one wave handles its softmax while its partner keeps the matrix core occupied (see the
-// main loop). A frame sits where FA2 keeps the running max (log2 units) and shifts only after the row max
-// exceeds it by RescaleThreshold (lazy rescale); QK applies it at no cost through the MFMA C operand
-// (s_seed). S and O are stored transposed (q on the MFMA N axis), keeping a q row's softmax in one lane.
-// Work lists and the KV split: attention_plan.hpp. Notation and the [tag]-cited rules: attention_prims.hpp.
+// gfx950 bf16 attention forward, head dim 128: strided, varlen (THD) or paged K/V, causal, GQA and optional LSE.
+// C API: attention.h; work lists and KV split: attention_plan.hpp; notation and [tag] rules: attention_prims.hpp.
+// A CTA: 384 q rows of one sequence and KV head; 8 waves of 48 rows (three 16-row q tiles) or 32 (two).
+// Per KV tile a wave runs a BLOCK (S(t) = Q K(t)^T, O += P(t-1) V(t-1)) then a SOFTMAX (P(t) = exp2(S*scale - frame)).
+// Waves w and w + 4 share a SIMD; group A runs half a tile ahead of B; one barrier (|) per tile:
+//   A:  block 0 | softmax 0 | block 1 | softmax 1 | ...
+//   B:          | block 0 | softmax 0 | block 1 | ...
+// S and O are transposed (q on the MFMA N axis); the frame is a lazily rescaled row max, applied through QK's C.
 
 #include "attention.h"
 #include "attention_plan.hpp"
@@ -18,47 +13,44 @@
 namespace attn {
 
 constexpr int HeadDim = 128;
-constexpr int DKSteps = HeadDim / 32;              // k-steps per QK
-constexpr int DMTiles = HeadDim / 16;              // PV M-tile count
+constexpr int DKSteps = HeadDim / 32;              // QK k-steps
+constexpr int DMTiles = HeadDim / 16;              // PV M-tiles (16 d each)
 
-// LDS layout: 3-deep ring buffers for K and for V (tile t occupies buffer t % 3), plus one Q slot per
-// wave. A tile buffer consists of 16 slabs of 512 elements, 2 filled by each wave's DMA. One slab holds
-// 8 (K) or 4 (V) kv rows in a row, so a wave's DMA covers rows 8w .. 8w + 7 of a tile (a single page
-// when paged).
+// LDS: 3-deep K and V rings (tile t in buffer t % 3) and one Q slot per wave. A tile is 16 slabs of 512
+// elements; wave w's DMA fills 2 of them, rows 8w .. 8w + 7 (one page when paged).
 //   K tile [d/64][kv/8][d%64/16][kv%8][d%16/8 ^ kv%8/4][d%8]    V tile [kv/4][d/16][kv%4][d%16]
 //   Q slot [q][d/8%8][d/64][d%8]
-// Pitches and the K swizzle render the reads conflict-free: LDS has 64 banks, and each 16-lane pass of
-// a read touches distinct 16-B chunks mod 256 B (measured: SQ_LDS_BANK_CONFLICT 0).
+// Pitches and the K swizzle keep each 16-lane read pass on distinct 16-B chunks mod 256 B, so no bank conflicts.
 constexpr int SlabsPerTile    = KvTile * HeadDim / SlabElems;
-constexpr int DmaInstsPerTile = SlabsPerTile / NumWaves;
-constexpr int BlockDmas = 2 * DmaInstsPerTile;     // K and V DMA instructions issued per wave, per block
-constexpr int KPitch = SlabElems + 32, KHalf = 8 * KPitch;         // K slabs; one half at d/64 = 1
+constexpr int DmasPerTile = SlabsPerTile / NumWaves;
+constexpr int BlockDmas = 2 * DmasPerTile;     // K and V DMA instructions per wave and block
+constexpr int KPitch = SlabElems + 32, KHalf = 8 * KPitch;         // K slab pitch; one half sits at d/64 = 1
 constexpr int VPitch = SlabElems + 64;
 constexpr int TileBufs = 3;
 constexpr int KBufElems = 2 * KHalf, VBufElems = SlabsPerTile * VPitch;
 constexpr int KRegion = TileBufs * KBufElems, VRegion = TileBufs * VBufElems;
-// Tile t's buffer within its region. Unsigned cast keeps the modulo from becoming a signed divide.
+// Tile t's buffer offset within its region; unsigned, so no signed-divide sequence.
 constexpr int k_buf(int t) { return (unsigned)t % TileBufs * KBufElems; }
 constexpr int v_buf(int t) { return (unsigned)t % TileBufs * VBufElems; }
-constexpr int QPitch = HeadDim + 16, QSlotElems = 16 * QPitch;   // row padding keeps reads conflict-free
+constexpr int QPitch = HeadDim + 16, QSlotElems = 16 * QPitch;   // padded: no bank conflicts
 constexpr int LdsElems = KRegion + VRegion + NumWaves * QSlotElems;
 static_assert(LdsElems * (int)sizeof(bf16_t) <= 163840, "gfx950 allows 160 KB");
 constexpr auto KTileStride =
     opus::make_tuple(opus::number<KHalf>{}, opus::number<KPitch>{}, 128_I, 16_I, 8_I, 1_I);
 constexpr auto VTileStride = opus::make_tuple(opus::number<VPitch>{}, 64_I, 16_I, 1_I);
 constexpr auto QSlotStride = opus::make_tuple(opus::number<QPitch>{}, 16_I, 8_I, 1_I);
-// Position of a K row's 8-element chunk c within d%16 (the swizzle).
+// Slot of a K row's 8-element chunk c within d%16 (the swizzle).
 __device__ constexpr int k_chunk(int c, int kv) { return c ^ (kv % 8 / 4); }
-constexpr int OPitch = HeadDim + 8;                // O staging (borrows the K/V region)
+constexpr int OPitch = HeadDim + 8;                // O staging, in the K/V region
 static_assert(NumWaves * MaxWaveRows * OPitch <= LdsElems, "O staging must fit");
 
-// An MFMA block spans 32 steps: 16 PV steps (ks, dt) then 16 QK steps (ks, kt). Each step fetches one
-// V^T or K fragment (QK steps where kt = 0 additionally fetch q tile 2) and drives the wave's 3 q tiles.
+// Block t: 16 PV steps (ks, dt), then 16 QK steps (ks, kt), one V^T or K fragment each (a QK kt = 0 step also
+// reads q tile 2) and an MFMA per q tile.
 constexpr int PvSteps = KvKSteps * DMTiles, BlockSteps = PvSteps + DKSteps * KvMTiles;
 struct BlockStep {
     bool pv;
     int ks, dt, kt;
-    int reads;                                     // number of LDS read instructions
+    int reads;                                     // LDS read instructions
 };
 template <int QTiles>
 constexpr BlockStep block_step(int j)
@@ -68,37 +60,35 @@ constexpr BlockStep block_step(int j)
     return {false, ks, 0, kt, kt == 0 && QTiles == 3 ? 2 : 1};
 }
 
-// QTiles: q tiles of 16 rows per wave, either 3 or 2 (attention_plan.hpp). Split: the launch contains
-// split q blocks whose parts save fp32 partials, or it stores LSEs (otherwise only whole q blocks' O).
-// Paged: K/V arrive as pages.
+// QTiles: 16-row q tiles per wave (3 or 2). Split: the launch writes LSEs or split-q partials. Paged: K/V come
+// from pages.
 template <int QTiles, bool Split, bool Paged = false>
 __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
 {
     static_assert(QTiles == 2 || QTiles == 3);
-    constexpr int WaveRows = 16 * QTiles;          // rows handled per wave in this launch
-    constexpr int LaneScores = KvMTiles * 4 * QTiles;   // S (and P) values held per lane
-    constexpr int Ahead = QTiles == 3 ? 2 : 3;     // MFMA block read-ahead measured in steps
+    constexpr int WaveRows = 16 * QTiles;
+    constexpr int LaneScores = KvMTiles * 4 * QTiles;   // S (and P) values per lane
+    constexpr int ReadLead = QTiles == 3 ? 2 : 3;     // steps between a fragment's LDS read and its MFMA
     __shared__ bf16_t lds[LdsElems];
     const int lane = threadIdx.x & (WaveSize - 1);
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / WaveSize);   // lives in an SGPR
     const int g = lane >> 4, l = lane & 15;
     const bool group_a = wave < NumWaves / 2;
 
-    // ==== work assignment =========================================================================
-    // The WaveRows q rows of one head this wave handles, starting at work.row0, plus its KV tiles
-    // (attention_plan.hpp).
+    // ==== work ====================================================================================
+    // This wave's q rows (from work.row0) and its KV tiles.
     const WaveWork work = wave_work<Split>(a, wave, WaveRows);
-    if (work.sq == 0) return;                      // empty work item (from device varlen lists)
+    if (work.sq == 0) return;                      // an empty item of a device-built varlen list
 
-    // Q rows, staged once the K/V DMA is under way. Rows past the sequence load its row 0 but stage zeros.
+    // Q loads, staged after the K/V DMA starts. Rows past the sequence load row 0 and stage zeros.
     constexpr int RowVecs = HeadDim / 8, QTileLoads = 16 * RowVecs / WaveSize;
     auto q_row = [&](int qt, int i) INLINE {
         return work.row0 + 16 * qt + (i * WaveSize + lane) / RowVecs;
     };
     const bf16_t* const q_rows = qo_rows(a.q, a.q_str, work);
     bf16_t* const o_rows = qo_rows(a.o, a.o_str, work);
-    pin_scalar(o_rows);                            // set here, or O's strides would stay live across the loop
-    __shared__ LseRows lse_stash[NumWaves];        // LSEs park in LDS: the loop can spare no SGPR
+    pin_scalar(o_rows);                            // computed before the loop
+    __shared__ LseRows lse_stash[NumWaves];        // parked in LDS: the loop needs every SGPR
     if constexpr (Split) {
         const LseRows lse = lse_rows(a, work);
         if (lane == 0) lse_stash[wave] = lse;
@@ -112,23 +102,22 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         }
 
     // ==== K/V DMA =================================================================================
-    // DMA instruction i of wave w fills K slab (d/64 = i, kv/8 = w) and V slab kv/4 = 2w + i within a
-    // tile; lane L writes the slab's 16 B at offset 16L, sourced from the wave's rows 8w .. 8w + 7:
+// DMA instruction i of wave w fills K slab (d/64 = i, kv/8 = w) and V slab (kv/4 = 2w + i); lane L writes
+// 16 B at 16L from rows 8w .. 8w + 7:
     //   K [kv][d] at [L%16/2][i, L/16, k_chunk(L%2, L%16/2), 8]    V [kv][d] at [i, L%8/2][L/8, L%2, 8]
-    // A row corresponds to a token, whose byte stride never exceeds 8 MB (host::valid_strides).
+    // Token strides are at most 8 MB (host::valid_strides).
     const uint32_t k_row_bytes = a.k_str.token * sizeof(bf16_t), v_row_bytes = a.v_str.token * sizeof(bf16_t);
     const auto k_src = lane_view<xdim<P<8>>, xdim<Y<2>, P<4>, P<2>, Y<8>>>(
         opus::make_tuple(k_row_bytes, 2_I), lane % 16 / 2, lane / 16, k_chunk(lane % 2, lane % 16 / 2));
     const auto v_src = lane_view<xdim<Y<2>, P<4>>, xdim<P<8>, P<2>, Y<8>>>(
         opus::make_tuple(v_row_bytes, 2_I), lane % 8 / 2, lane / 8, lane % 2);
 
-    // Buffer resources span the wave's rows from tile rsrc_t0 through the sequence's final key; rows
-    // beyond it read as 0 rather than the following sequence's (masked P = 0 times a NaN V yields NaN).
-    // A tile's byte offset rides in the 32-bit soffset (range-checked): resources advance every
-    // rsrc_tiles tiles (2 when loaded ahead; for paged, never, since each block produces the next's).
+    // Buffer resources span tile rsrc_t0 through the sequence's last key: rows past it read 0, not the next
+    // sequence's (0 x NaN V is NaN). The tile offset is in soffset, which is range-checked, so resources advance
+// every rsrc_tiles tiles (paged: each block builds the next one's).
     const bf16_t* const k_rows = kv_rows(a.k, a.k_str, work);
     const bf16_t* const v_rows = kv_rows(a.v, a.v_str, work);
-    const size_t num_rows = work.kv_len - work.tile_lo * KvTile;   // measured from kv_row0
+    const size_t num_rows = work.kv_len - work.tile_lo * KvTile;   // counted from kv_row0
     auto kv_rsrc = [&](const bf16_t* rows, uint32_t row_bytes, int t) INLINE {
         return kv_rsrc_words(rows, (size_t)t * KvTile + 8 * wave, num_rows, row_bytes,
                              HeadDim * sizeof(bf16_t));
@@ -145,12 +134,10 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         }
     };
 
-    // Paged: rows 8w .. 8w + 7 of a tile fall within a single page (8 divides the page size). The wave's
-    // resources begin at the first with soffset 0 and run to the sequence's last key, no more than 256
-    // rows long (spanning just 8 rows would slow the DMA by 9%). V's resource equals K's from the prior
-    // block shifted by v - k (both pools share strides). k_page_rsrc(i): piece i of the next K resource
-    // (rows k_vk + 64, in page k_page) and of the page-after-next's table entry; every piece anchors what
-    // it writes.
+// Paged: rows 8w .. 8w + 7 of a tile lie in one page (8 divides the page size). A resource starts at that page
+// (soffset 0) and spans up to 256 rows, capped at the last key; V's is the previous block's K resource shifted
+// by v - k (shared strides). k_page_rsrc(i): piece i of the next K resource (rows k_vk + 64, page k_page) and
+// of the page-after-next's table entry.
     const uint64_t k_pool = (uint64_t)(a.k + offset(a.k_str, 0, 0, work.kv_head));
     const uint64_t v_delta = (uint64_t)a.v - (uint64_t)a.k;
     const uint32_t page_bytes = a.k_str.batch * 2, page_mask = (1u << a.page_shift) - 1;
@@ -175,7 +162,8 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     };
     constexpr int KPagePieces = 9;
     auto v_base = [&]() INLINE { return ((uint64_t)k_rsrc.y << 32 | k_rsrc.x) + v_delta; };
-    auto next_page = [&]() INLINE {                // the next block's page (fetched a tile earlier), plus the one after
+    // Take the next block's page (loaded a tile earlier), then prefetch the one after it.
+    auto next_page = [&]() INLINE {
         wait_page(k_next_page);
         k_page = k_next_page;
         k_next_page = load_page(a.page_table, k_entry);
@@ -194,25 +182,24 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         buffer_load_dwordx4_lds(v_rsrc, (lds_ptr_t)v_slab(t, i), v_src(i), off);
     };
 
-    // Block t issues loads for K(t + k_ahead) and V(t + v_ahead): buffers nobody reads until the next
-    // barrier. (A's block 0 redundantly reloads V(0) with identical data.)
+    // Block t loads K(t + k_ahead) and V(t + v_ahead); the buffers are unread until the next barrier (A's
+    // block 0 reloads V(0), unchanged).
     const int k_ahead = group_a ? 1 : 2, v_ahead = group_a ? 0 : 1;
 
-    // Block t's DMA set-up runs entirely in SALU, ahead of the block [salu]: byte offsets and LDS slabs (M0).
+    // Block t's DMA registers, set in SALU before the block [salu]: soffsets and slab addresses (M0).
     uint32_t k_off = 0, v_off = 0, dma_lds[BlockDmas];
     auto set_dma = [&](int t) INLINE {
         if constexpr (!Paged) {
             k_off = (t - rsrc_t0 + k_ahead) * k_tile_bytes;
             v_off = (t - rsrc_t0 + v_ahead) * v_tile_bytes;
         }
-        for (int i = 0; i < DmaInstsPerTile; ++i) {
+        for (int i = 0; i < DmasPerTile; ++i) {
             dma_lds[i] = (uint32_t)(uintptr_t)(lds_ptr_t)k_slab(t + k_ahead, i);
-            dma_lds[DmaInstsPerTile + i] = (uint32_t)(uintptr_t)(lds_ptr_t)v_slab(t + v_ahead, i);
+            dma_lds[DmasPerTile + i] = (uint32_t)(uintptr_t)(lds_ptr_t)v_slab(t + v_ahead, i);
         }
     };
 
-    // Paged: following its DMA, block t builds block t + 1's resources one piece per step (2 for V, then
-    // K's), anchoring each there; an SALU op costs 4 issue cycles and a step fits two [salu].
+    // Paged: after its DMA, block t builds block t + 1's resources, one piece per step (V's 2, then K's) [salu].
     constexpr int NextRsrcPieces = 2 + KPagePieces;
     auto next_rsrc = [&](int i) INLINE {
         if (i == 0) v_rsrc.x = v_base(), v_rsrc.y = v_base() >> 32, anchor(v_rsrc);
@@ -220,22 +207,20 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         if (i >= 2) k_page_rsrc(i - 2);
     };
 
-    // Block step j's DMA: instruction n is issued at step 4n + 1 [dma], after waiting on that step's
-    // fragment (omitting the wait makes LLVM spill). M0 is assigned one step in advance, DMA 0's in
-    // prep_block.
+    // Block step j's DMA [dma]: instruction n's M0 at step 4n (DMA 0's in prep_block), its load at 4n + 1,
+    // ordered after the step's fragment.
     auto dma_step = [&](int j, const bf16x8_t& frag) INLINE {
-        const int n = j / 4, i = j - (4 * BlockDmas - 2);   // i: the paged piece, starting the step after
+        const int n = j / 4, i = j - (4 * BlockDmas - 2);   // i: the paged piece
         if (j % 4 == 0 && n > 0 && n < BlockDmas) set_m0(dma_lds[n]);
         if (j % 4 == 1 && n < BlockDmas) {
-            if (n < DmaInstsPerTile) buffer_load_dwordx4_lds_m0(k_rsrc, k_src(n), k_off, frag);
-            else buffer_load_dwordx4_lds_m0(v_rsrc, v_src(n - DmaInstsPerTile), v_off, frag);
+            if (n < DmasPerTile) buffer_load_dwordx4_lds_m0(k_rsrc, k_src(n), k_off, frag);
+            else buffer_load_dwordx4_lds_m0(v_rsrc, v_src(n - DmasPerTile), v_off, frag);
         }
         if (Paged && i >= 0 && i < NextRsrcPieces) next_rsrc(i);
     };
 
-    // Prologue: loads K(0), V(0), and B's portion of K(1) (A's block 0 loads A's portion). Paged: the
-    // pages for tiles 0 .. 4 are fetched together (leaving none in flight [lgkm]); each K resource is
-    // completed (k_vk advancing one tile), block 0's coming last.
+    // Prologue: K(0), V(0) and B's K(1) (A's comes in block 0). Paged: pages of tiles 0 .. 4 are loaded and
+    // waited for together [lgkm]; each K resource is built in full, block 0's last.
     int pg[5];
     if constexpr (Paged) {
         for (int t = 0; t < 5; ++t)
@@ -250,11 +235,11 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         v_rsrc = rsrc_t{(uint32_t)v_base(), (uint32_t)(v_base() >> 32), k_rsrc.z, k_rsrc.w};
     };
     if constexpr (Paged) k_rsrc_at(pg[0]), v_rsrc_at_k();
-    for (int i = 0; i < DmaInstsPerTile; ++i) load_k(0, 0, i);
-    for (int i = 0; i < DmaInstsPerTile; ++i) load_v(0, 0, i);
+    for (int i = 0; i < DmasPerTile; ++i) load_k(0, 0, i);
+    for (int i = 0; i < DmasPerTile; ++i) load_v(0, 0, i);
     if (!group_a) {
         if constexpr (Paged) k_rsrc_at(pg[1]);
-        for (int i = 0; i < DmaInstsPerTile; ++i) load_k(1, Paged ? 0 : k_tile_bytes, i);
+        for (int i = 0; i < DmasPerTile; ++i) load_k(1, Paged ? 0 : k_tile_bytes, i);
     }
     if constexpr (Paged) {
         v_rsrc_at_k();
@@ -264,15 +249,15 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     }
 
     // ==== Q =======================================================================================
-    // Q travels through this wave's LDS slot, which arranges d to match K's fragments. Tiles 0 and 1
-    // move on into registers; tile 2 remains in the slot and is re-read during QK (registers are full).
+    // Q passes through the wave's LDS slot into QK's B layout. Tiles 0 and 1 stay in registers; tile 2 is
+    // re-read from the slot during QK.
     const auto q_store = lane_view<xdim<Y<4>, P<4>>, xdim<P<8>>, xdim<P<2>>, xdim<Y<8>>>(
         QSlotStride, lane / 16, lane % 8, lane / 8 % 2);
     const auto q_read = lane_view<xdim<P<16>>, xdim<Y<4>, P<2>>, xdim<P<2>>, xdim<Y<8>>>(
         QSlotStride, l, g / 2, g % 2);
     bf16_t* const q_slot = lds + KRegion + VRegion + wave * QSlotElems;
     lds_addr_t q_addr = (lds_addr_t)(q_slot + q_read.lane);
-    pin_after(q_addr);                             // held in a single register: avoids an add each block
+    pin_after(q_addr);                             // one register, no add per block
     bf16x8_t q_frag[QTiles][DKSteps];              // QK's B operands
     for (int qt = 0; qt < QTiles; ++qt) {
         for (int i = 0; i < QTileLoads; ++i) {
@@ -289,19 +274,19 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     // S^T(kt, qt)[i] = S^T[kv][q = 16qt + l], with kv at [kt/2, g/2, kt%2, g%2, i] (C row 4g + i of K(kt)).
     f32x4_t s_acc[KvMTiles][QTiles];
     const float scale = a.scale_log2e;
-    const float threshold = readfirstlane(RescaleThreshold / scale);   // expressed in S units, kept in SGPRs
+    const float threshold = readfirstlane(RescaleThreshold / scale);   // in S units; SGPR
     const float inv_scale = readfirstlane(1.0f / scale);
 
-    // -frame / scale per row, used as QK's C operand, so S emerges relative to the frame.
+    // QK's C operand, -frame / scale per row, so S arrives relative to the frame.
     f32x4_t s_seed[QTiles];
     for (int qt = 0; qt < QTiles; ++qt) s_seed[qt] = -Frame0 / scale;
 
-    // P, PV's B operands: p_frag[ks][qt] carries S tiles 2ks and 2ks + 1 in V^T's kv order.
+    // PV's B: p_frag[ks][qt] holds S tiles 2ks and 2ks + 1 in V^T's kv order.
     bf16x8_t p_frag[KvKSteps][QTiles] = {};
 
-    // P's row sums, computed with a sparse MFMA: B stacks two P fragments along k (the first at k < 32);
-    // A is all ones with 2:4 sparsity, and its row m retains fragment m % 4 / 2 at positions 0, 1 (even m)
-    // or 2, 3 (odd m) of every four k. Thus C0 + C1 and C2 + C3 give the two fragments' row sums.
+    // Row sums of P by sparse MFMA: B stacks two P fragments along k (the first at k < 32); A is 2:4-sparse ones,
+    // row m keeping fragment m % 4 / 2 at k positions 0, 1 (even m) or 2, 3 (odd m) of each four.
+    // C0 + C1 and C2 + C3 are the two fragments' row sums.
     const bf16x8_t ones = (bf16_t)(((l & 3) < 2) == (g < 2) ? 1.0f : 0.0f);   // row l, k 16g .. 16g + 15
     const int ones_idx = (int)((l & 1) ? 0xEEEEEEEEu : 0x44444444u);
     f32x4_t row_sum01{}, row_sum2{};               // q tiles 0 and 1; q tile 2's pair of k-steps
@@ -313,18 +298,17 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     };
 
     // ==== LDS reads ===============================================================================
-    // K fragment (kt, ks), QK's A operand, rows l and columns 8g .. 8g+7: within the K tile
-    // [d/64][kv/8][d%64/16][kv%8][d%16/8 ^ kv%8/4][d%8] it sits at
+    // K fragment (kt, ks), QK's A: row l, columns 8g .. 8g + 7, in the K tile at
     // [g%2][kt/2, l/8, kt%2][ks][l%8][k_chunk(g/2, l)][8].
     const auto k_read =
         lane_view<xdim<P<2>>, xdim<Y<2>, P<2>, Y<2>>, xdim<Y<4>>, xdim<P<8>>, xdim<P<2>>, xdim<Y<8>>>(
             KTileStride, g % 2, l / 8, l % 8, k_chunk(g / 2, l));
-    // V^T fragment (ks, dt), PV's A operand: two ds_read_b64_tr_b16 calls (h = 0, 1) on V tile
-    // [kv/4][d/16][kv%4][d%16] at [ks, g/2, h, g%2][dt][l/4][l%4, 4]; lane l receives column d = 16dt + l.
+    // V^T fragment (ks, dt), PV's A: two ds_read_b64_tr_b16 (h = 0, 1) at [ks, g/2, h, g%2][dt][l/4][l%4, 4]
+    // of the V tile; lane l receives column d = 16dt + l.
     const auto v_read = lane_view<xdim<Y<2>, P<2>, Y<2>, P<2>>, xdim<Y<8>>, xdim<P<4>>, xdim<P<4>, Y<4>>>(
         VTileStride, g / 2, g % 2, l / 4, l % 4);
 
-    // Step s's fragment, fetched from the supplied V and K tile addresses (QK steps with kt = 0 fetch q tile 2 as well).
+    // Step s's fragment (QK kt = 0 also reads q tile 2).
     auto read_step = [&](lds_addr_t v_addr, lds_addr_t k_addr, BlockStep s) INLINE {
         if (s.pv)
             return join(ds_read_b64_tr_b16(v_addr + v_read.step(s.ks, 0, s.dt)),
@@ -334,23 +318,21 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         return ds_read_b128(k_addr + k_read.step(s.kt / 2, s.kt % 2, s.ks));
     };
 
-    // ==== block start =============================================================================
-    // Block t's DMA set-up, read addresses and first two fragments are readied during softmax t - 1, so
-    // the block opens directly with its first MFMA. V(t - 1) and K(t) become visible at the barrier
-    // preceding softmax t - 1 (A) or block t - 1 (B).
-    lds_addr_t v_lane = (lds_addr_t)(lds + KRegion + v_read.lane);   // held whole: v_addr costs one add
+    // ==== next block's set-up =====================================================================
+    // Prepared in softmax t - 1 so block t starts with an MFMA: DMA registers, read addresses and first fragments.
+    lds_addr_t v_lane = (lds_addr_t)(lds + KRegion + v_read.lane);   // each tile's v_addr is one add
     pin_after(v_lane);
-    int block_v_buf, block_k_buf, next_v_buf;      // buffers for V(t - 1), K(t), and V(t) in B's reads
+    int block_v_buf, block_k_buf, next_v_buf;      // V(t - 1), K(t), V(t) (B's look-ahead)
     lds_addr_t v_addr, k_addr, v_next;
-    bf16x8_t first_frags[Ahead];
+    bf16x8_t first_frags[ReadLead];
     auto prep_block = [&](int t) INLINE {
         set_dma(t);
-        set_m0(dma_lds[0]);                        // M0 is written nowhere else
-        block_v_buf = v_buf(max(t - 1, 0));        // block 0 (P = 0) reads V(0); others may contain NaNs
+        set_m0(dma_lds[0]);                        // DMA 0's M0; the block sets the others
+        block_v_buf = v_buf(max(t - 1, 0));        // block 0 (P = 0) reads V(0): a stale one may hold NaNs
         block_k_buf = k_buf(t);
         next_v_buf = v_buf(t);
     };
-    auto prep_block_addrs = [&]() INLINE {         // pinned: kept out of the block
+    auto prep_block_addrs = [&]() INLINE {         // pinned: computed here, not in the block
         v_addr = v_lane + block_v_buf;
         k_addr = (lds_addr_t)(lds + block_k_buf + k_read.lane);
         v_next = v_lane + next_v_buf;
@@ -358,13 +340,12 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         pin_after(k_addr);
     };
     auto prep_block_frags = [&]() INLINE {
-        for (int i = 0; i < Ahead; ++i) first_frags[i] = read_step(v_addr, k_addr, block_step<QTiles>(i));
+        for (int i = 0; i < ReadLead; ++i) first_frags[i] = read_step(v_addr, k_addr, block_step<QTiles>(i));
     };
 
     // ==== frames ==================================================================================
-    // Max of q tile qt's S within this lane, arranged as a tree (a dependent max chain runs 3x slower).
-    // keep_nan: the frame test's max, made NaN by a NaN S. MaskScore, a 17th leaf, turns each node into
-    // a 3-operand maximum3 while leaving every frame unchanged.
+    // q tile qt's largest S in this lane, as a max3 tree. keep_nan: NaN if any S is NaN (for the frame test).
+    // MaskScore is a 17th leaf so every node takes three operands.
     auto lane_max = [&](int qt, auto keep_nan) INLINE {
         auto max = [](float a, float b, float c) INLINE {
             if constexpr (decltype(keep_nan)::value) return maybe_nan(maximum3(a, b, c));
@@ -377,14 +358,14 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         const float m3 = max(s[9], s[10], s[11]), m4 = max(s[12], s[13], s[14]);
         return max(MaskScore, max(m0, m1, m2), max(m3, m4, s[15]));
     };
-    // Per-row max of every q tile, reduced across the 4 lanes holding that row.
+    // Row maxima of every q tile, over the row's 4 lanes.
     auto row_maxes = [&](float (&m)[QTiles]) INLINE {
         for (int qt = 0; qt < QTiles; ++qt) m[qt] = lane_max(qt, std::false_type{});
         max_lane_xor32(m);
         max_lane_xor16(m);
     };
 
-    // Frame displacements for q tile qt, scalar fp32 [pk]; shift is measured in S units.
+    // Frame updates of q tile qt in scalar fp32 [pk]; shift in S units.
     auto shift_frames = [&](int qt, float shift) INLINE {
         for (int i = 0; i < 4; ++i) s_seed[qt][i] -= shift;
         for (int kt = 0; kt < KvMTiles; ++kt)
@@ -403,37 +384,34 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         }
     };
 
-    // First tile: a frame sitting more than Frame0 above its row's max underflows P. Should any row have
-    // one, all rows' frames shift to Frame0 above their max.
-    auto set_frames = [&]() INLINE {
+    // First tile: if any row's frame is more than Frame0 above its max (P would underflow), every row's frame
+    // moves to Frame0 above its own max.
+    auto set_row_frames = [&]() INLINE {
         bool low = false;
         for (int qt = 0; qt < QTiles; ++qt) {
             const float m = lane_max(qt, std::false_type{});
-            low |= (m > NegInf) & (m * scale < -Frame0);   // & rather than &&: avoids a per-lane branch
+            low |= (m > NegInf) & (m * scale < -Frame0);   // &: no per-lane branch
         }
         if (!any_lane(low)) return;
         float m[QTiles];
         row_maxes(m);
-        for (int qt = 0; qt < QTiles; ++qt)                 // the max becomes the seed, -Frame0 / scale
+        for (int qt = 0; qt < QTiles; ++qt)                 // seed becomes -Frame0 / scale
             shift_frames(qt, m[qt] > NegInf ? m[qt] - s_seed[qt][0] : 0.0f);
     };
 
-    // Later tiles: when a row's max exceeds its frame by RescaleThreshold, every row in the wave lifts
-    // its frame to RescaleHeadroom above its own max. S (in log2 units) updates immediately, as do A's
-    // row sums before they end its softmax; O, the seeds and B's row sums update at the next block's
-    // start. A NaN or +inf S (from non-finite inputs) follows this path as well: the test's maxes retain
-    // NaN.
+    // Later tiles: once a row max exceeds its frame by RescaleThreshold, every row's frame moves to
+    // RescaleHeadroom above its max. S and A's row sums update now; O, seeds and B's row sums update at the next
+    // block's start. A NaN or +inf S takes this path too.
     bool frames_moved = false;                     // set by the latest softmax
-    float m[QTiles];                               // first the test's lane maxes, then the shifts (two arrays spill)
+    float m[QTiles];                               // the test's lane maxima, then the shifts
     auto frames_outgrown = [&]() INLINE {
         for (int qt = 0; qt < QTiles; ++qt) m[qt] = lane_max(qt, std::true_type{});   // in S units
         return lanes_above_or_nan(maybe_nan(maximum_n(m)), threshold) != 0;
     };
-    // A NaN or +inf S could leak into other rows' sums via the sparse MFMA's zeros (0 x NaN = NaN), so
-    // that row's S all score MaskScore, its frame remains, and its row sum becomes NaN, making the row's
-    // O NaN (inv_row_sum). bad: the lanes holding such an S, per q tile.
+    // A row with a NaN or +inf S: its S become MaskScore (a sparse MFMA 0 x NaN would reach other rows), its
+    // frame stays, its row sum becomes NaN (so its O is NaN). bad: the lanes holding such an S, per q tile.
     auto mask_nonfinite = [&](const uint64_t (&bad)[QTiles]) INLINE {
-        const int l = fresh_lane_id() & 15;        // not held live on a rare path
+        const int l = fresh_lane_id() & 15;        // not live outside this rare path
         const float nan = opaque_nan();
         for (int qt = 0; qt < QTiles; ++qt) {
             const bool row_bad = has_row(bad[qt], l);
@@ -444,9 +422,9 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         }
     };
     auto move_frames = [&](auto group_a) INLINE {
-        uint64_t bad[QTiles];                      // lanes holding a NaN or +inf S (the lane max preserves it)
+        uint64_t bad[QTiles];                      // lanes holding a NaN or +inf S
         for (int qt = 0; qt < QTiles; ++qt) bad[qt] = lanes_above_or_nan(m[qt], MaxFinite);
-        if constexpr (!group_a) s_setprio<1>();    // within a rescale window, B's softmax is the long path
+        if constexpr (!group_a) s_setprio<1>();    // B's softmax is the long path here
         max_lane_xor32(m);
         max_lane_xor16(m);
         for (int qt = 0; qt < QTiles; ++qt) {
@@ -456,7 +434,7 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
             if constexpr (group_a) scale_row_sums(qt, __builtin_amdgcn_exp2f(-m[qt]));
         }
         if constexpr (!group_a) s_setprio<0>();
-        sched_fence();                             // the compares' SALU runs last [vcc]
+        sched_fence();                             // the compares' SALU last [vcc]
         uint64_t any_bad = 0;
         for (int qt = 0; qt < QTiles; ++qt) any_bad |= bad[qt];
         if (unlikely(any_bad != 0)) mask_nonfinite(bad);
@@ -471,10 +449,10 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     };
 
     // ==== softmax =================================================================================
-    // Keys beyond the sequence's end, or past a causal row's last key, score MaskScore.
-    auto mask_edge_tile = [&](int kv0) INLINE {
-        const int lane = fresh_lane_id(), g = lane >> 4, l = lane & 15;   // not held live on a rare path
-        // The kv index of this lane's S value (kt, i), matching s_acc's layout.
+    // Keys past the sequence or past a causal row's last key: S = MaskScore.
+    auto mask_scores = [&](int kv0) INLINE {
+        const int lane = fresh_lane_id(), g = lane >> 4, l = lane & 15;   // not live outside this rare path
+        // kv of this lane's S value (kt, i).
         const auto s_kv = lane_view<xdim<Y<2>, P<2>, Y<2>, P<2>, Y<4>>>(opus::make_tuple(1_I), g / 2, g % 2);
         for (int qt = 0; qt < QTiles; ++qt) {
             int kv_limit = work.kv_len - 1;
@@ -486,17 +464,17 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         }
     };
 
-    // Tiles needing extra softmax work: the first, the masked ones (running to the end), and the last
-    // before the buffer resources advance. A single per-tile test covers all three [branch].
-    int next_extra = 0;                            // the following such tile
+    // Rare tiles: the first, the masked ones (through the end), and the last before the resources advance; one
+    // test per tile [branch].
+    int next_rare_tile = 0;                            // the next rare tile
     auto tile_extras = [&](int t) INLINE {
-        if (t >= work.num_unmasked) mask_edge_tile((work.tile_lo + t) * KvTile);
-        if (t == 0) set_frames();
+        if (t >= work.num_unmasked) mask_scores((work.tile_lo + t) * KvTile);
+        if (t == 0) set_row_frames();
         move_rsrc(t + 1);
-        next_extra = max(t + 1, min(work.num_unmasked, rsrc_t0 + rsrc_tiles - 1));
+        next_rare_tile = max(t + 1, min(work.num_unmasked, rsrc_t0 + rsrc_tiles - 1));
     };
 
-    // Per-score passes over scalar fp32 values [pk].
+    // Per-score passes in scalar fp32 [pk].
     auto scale_scores = [&]() INLINE {
         for (int kt = 0; kt < KvMTiles; ++kt)
             for (int qt = 0; qt < QTiles; ++qt)
@@ -513,32 +491,36 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
                 for (int s = 0; s < 8; ++s) p_frag[ks][qt][s] = (bf16_t)s_acc[2 * ks + s / 4][qt][s % 4];
     };
 
-    // Softmax t: P(t) = exp2(S scale - frame), carried out in three phases. Rare work is out of line [branch].
+    // Softmax t: P(t) = exp2(S scale - frame) in three phases; rare work out of line [branch].
     auto softmax = [&](auto group_a, int t) INLINE {
-        if constexpr (Paged && group_a) next_page();   // B: its next block's first reads are already in flight
-        if (unlikely(t >= next_extra)) tile_extras(t);
+        if constexpr (Paged && group_a) next_page();   // B's later: its first reads are in flight [lgkm]
+        if (unlikely(t >= next_rare_tile)) tile_extras(t);
 
-        // 1. Convert S to log2 units; should any row have outgrown its frame, all frames move.
+        // 1. S to log2 units; if any row outgrew its frame, all frames move.
         frames_moved = frames_outgrown();
-        scale_scores();                            // hides the test's latency
-        valu_then_salu<2 * LaneScores, 2>();       // all VALU (< 2 per score), then the test's SALU [vcc]
+        scale_scores();                            // covers the test's latency
+        __builtin_amdgcn_sched_group_barrier(SchedValu, 2 * LaneScores, 0);   // all VALU (< 2 per score),
+        __builtin_amdgcn_sched_group_barrier(SchedSalu, 2, 0);                // then the test's SALU [vcc]
         if (unlikely(frames_moved)) move_frames(group_a);
 
-        // 2. The exps issued back to back [mfma], with the next block's scalar set-up interposed [salu].
+        // 2. Exps back to back [mfma], the next block's SALU set-up between them [salu].
         if constexpr (Paged && !group_a) next_page();
         exp_scores();
         prep_block(t + 1);
-        interleave<SchedTrans, SchedSalu, LaneScores>();
+        for (int i = 0; i < LaneScores; ++i) {     // exp, SALU, exp, SALU, ...
+            __builtin_amdgcn_sched_group_barrier(SchedTrans, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(SchedSalu, 1, 0);
+        }
         sched_fence();
 
-        // 3. P converted to bf16, plus the next block's opening.
+        // 3. P to bf16; the next block's addresses (A: also its first fragments and P's row sums).
         convert_p();
         prep_block_addrs();
-        if constexpr (group_a) {                   // B reads its first fragments within its block
-            pin_before(p_frag);                    // the reads trail the conversions [lds]
+        if constexpr (group_a) {                   // B reads its first fragments in its block
+            pin_before(p_frag);                    // reads after the conversions [lds]
             prep_block_frags();
             sched_fence();
-            row_sums();                            // their MFMA time hides the loop's back edge
+            row_sums();                            // covers the loop's back edge
         }
     };
 
@@ -554,16 +536,15 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         }
     };
 
-    // A step emits MFMA, read, MFMA, read, MFMA, with every LDS read tucked behind an MFMA.
+    // A step's order: MFMA, read, MFMA, read, MFMA; read i issues behind MFMA i (a step has at most 2 reads).
     auto order_step = [](int reads) INLINE {
         for (int qt = 0; qt < QTiles; ++qt) {
-            sched_group<SchedMfma>();
-            if (qt < QTiles - 1 && reads > qt) sched_group<SchedDsRead>();
+            __builtin_amdgcn_sched_group_barrier(SchedMfma, 1, 0);
+            if (qt < reads) __builtin_amdgcn_sched_group_barrier(SchedDsRead, 1, 0);
         }
-        if (QTiles == 2 && reads > 1) sched_group<SchedDsRead>();   // two MFMAs paired with two reads
     };
 
-    // Waits for this wave's DMA to land and all waves' to be visible. Nothing is scheduled across it.
+    // Wait for this wave's DMA, then for all waves; fenced.
     auto tile_barrier = []() INLINE {
         s_waitcnt_vmcnt<0>();
         sched_fence();
@@ -571,54 +552,51 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         sched_fence();
     };
 
-    // MFMA block t: fenced steps [fence], each fetching the fragment belonging to the step two ahead.
+    // Block t: PV(t-1) then QK(t) steps, each reading ReadLead steps ahead; steps are fenced [fence].
     auto mfma_block = [&](auto group_a) INLINE {
-        if (unlikely(frames_moved)) follow_frames(group_a);   // dual-issues alongside the partner's softmax
-        if constexpr (!group_a) {                  // B's block goes first: A's MFMAs fill the gaps
-            s_setprio<1>();                        // set before the barrier: B's MFMAs issue on release
+        if (unlikely(frames_moved)) follow_frames(group_a);   // beside the partner's softmax
+        if constexpr (!group_a) {                  // B's block first; A's MFMAs fill its gaps
+            s_setprio<1>();                        // before the barrier: B's MFMAs issue on its release
             tile_barrier();
-            row_sums();                            // for P(t - 1), ahead of its PV
+            row_sums();                            // of P(t - 1), ahead of its PV
         }
 
         bf16x8_t frag[BlockSteps];
-        for (int i = 0; i < Ahead; ++i) frag[i] = first_frags[i];
+        for (int i = 0; i < ReadLead; ++i) frag[i] = first_frags[i];
 #pragma unroll                                     // j has to stay a constant
         for (int j = 0; j < BlockSteps; ++j) {
-            const int r = j + Ahead;
+            const int r = j + ReadLead;
             const BlockStep step = block_step<QTiles>(j), ahead = block_step<QTiles>(r % BlockSteps);
 
             sched_fence();
             dma_step(j, frag[j]);
             sched_fence();
 
-            // Beyond the block's end, B reads the next block's first two fragments while A reads nothing.
+            // Past the block end, B reads the next block's first fragments; A reads nothing.
             if (r < BlockSteps) frag[r] = read_step(v_addr, k_addr, ahead);
             else if constexpr (!group_a) first_frags[r - BlockSteps] = read_step(v_next, k_addr, ahead);
             mfma_step(step, frag[j]);
             order_step(r < BlockSteps || !group_a ? ahead.reads : 0);
         }
-        sched_fence();                             // the MFMAs are issued ahead of A's DMA wait
+        sched_fence();                             // MFMAs before A's DMA wait
         if constexpr (group_a) tile_barrier();
         else s_setprio<0>();
     };
 
-    // The block for a tile masked across every row of this wave: just its DMA portion.
+    // Block of a tile masked for every row of this wave: its DMA only.
     auto dma_only_block = [&](auto group_a, int t) INLINE {
         move_rsrc(t);
         if constexpr (Paged) next_page();
-        set_dma(t);                                // supplies k_off and v_off
+        set_dma(t);                                // k_off, v_off
         if constexpr (!group_a) tile_barrier();
-        for (int i = 0; i < DmaInstsPerTile; ++i) load_k(t + k_ahead, k_off, i);
-        for (int i = 0; i < DmaInstsPerTile; ++i) load_v(t + v_ahead, v_off, i);
+        for (int i = 0; i < DmasPerTile; ++i) load_k(t + k_ahead, k_off, i);
+        for (int i = 0; i < DmasPerTile; ++i) load_v(t + v_ahead, v_off, i);
         if constexpr (Paged) for (int i = 0; i < NextRsrcPieces; ++i) next_rsrc(i);
         if constexpr (group_a) tile_barrier();
     };
 
     // ==== the main loop ===========================================================================
-    // A single barrier per tile. Between barriers the SIMD's two waves swap roles on their own:
-    //   A:  block 0 | softmax 0, block 1 | softmax 1, block 2 | ...
-    //   B:          | block 0, softmax 0 | block 1, softmax 1 | ...
-    // Every point at which the groups diverge:
+    // How the groups differ (timeline: file header):
     //                            A                              B
     //   prologue DMA             K(0), V(0)                     K(0), V(0), K(1)
     //   block t's DMA            K(t + 1), V(t)                 K(t + 2), V(t + 1)
@@ -627,19 +605,19 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     //   row sums of P(t)         end of softmax t               start of block t + 1
     //   issue priority           0                              1 in its block and its frame moves
     if (group_a) s_waitcnt_vmcnt<0>();
-    else         s_waitcnt_vmcnt<DmaInstsPerTile>();   // K(1) might still be in flight
-    s_barrier();                                       // tile 0 becomes visible to every wave
+    else         s_waitcnt_vmcnt<DmasPerTile>();       // K(1) may still be in flight
+    s_barrier();                                       // make tile 0 visible to every wave
 
-    // Each group executes its own copy, with group_a a compile-time constant, so no group test [branch].
+    // One copy per group; group_a is a compile-time constant [branch].
     auto main_loop = [&](auto group_a) INLINE {
         prep_block(0);
         prep_block_addrs();
-        prep_block_frags();                            // B's as well: block 0 has no predecessor
+        prep_block_frags();                            // B's too: block 0 has no predecessor
         for (int t = 0; t < work.num_live; ++t) {
             mfma_block(group_a);
             softmax(group_a, t);
         }
-        mfma_block(group_a);                           // final PV (its QK is dead code)
+        mfma_block(group_a);                           // the final PV (its QK goes unused)
         for (int t = work.num_live + 1; t <= work.num_tiles; ++t) dma_only_block(group_a, t);
     };
     if (group_a) main_loop(std::true_type{});
@@ -649,7 +627,7 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     float row_sum[QTiles] = {row_sum01[0] + row_sum01[1], row_sum01[2] + row_sum01[3]};
     if constexpr (QTiles == 3) row_sum[2] = (row_sum2[0] + row_sum2[1]) + (row_sum2[2] + row_sum2[3]);
 
-    if (work.slot >= 0) {                          // a part of a split q block: fp32 partials destined for merge_parts
+    if (work.slot >= 0) {                          // a part of a split q block: fp32 partials for merge_parts
         for (int qt = 0; qt < QTiles; ++qt) {
             const int q = work.row0 + 16 * qt + l;
             if ((unsigned)q >= (unsigned)work.sq) continue;
@@ -661,14 +639,13 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         }
         return;
     }
-    if constexpr (Split) {                         // one whole q block's LSEs, with a lane per row
+    if constexpr (Split) {                         // LSEs of a whole q block, one lane per row
         const LseRows lse = lse_stash[wave];
         for (int qt = 0; qt < QTiles; ++qt)
             if (g == 0) store_lse(lse, work, work.row0 + 16 * qt + l, -s_seed[qt][0] * scale, row_sum[qt]);
     }
 
-    // O^T detours through LDS so the global stores write complete rows. It reclaims the K/V region once
-    // all waves' final DMA has landed and no wave still reads K or V.
+    // Stage O^T through LDS for full-row global stores, once every wave's last DMA has landed.
     s_waitcnt_vmcnt<0>();
     s_barrier();
     bf16_t* o_stage = lds + wave * (WaveRows * OPitch);
@@ -681,7 +658,7 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         }
     }
     constexpr int RowsPerStore = WaveSize / RowVecs;
-    const int id = fresh_lane_id();                    // otherwise the Q load's row addresses stay live and spill
+    const int id = fresh_lane_id();                    // recomputed: avoids a spill
     for (int r = 0; r < WaveRows / RowsPerStore; ++r) {
         const int row = r * RowsPerStore + id / RowVecs;
         const int d   = id % RowVecs * 8;
@@ -692,12 +669,12 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     }
 }
 
-}  // closes namespace attn
+}  // namespace attn
 
 // ---- the C API, declared in attention.h -------------------------------------------------------
 using namespace attn;
 
-// The kernels (attention_plan.hpp). A 32-row-wave KV tile costs 0.83 that of a 48-row one (fitted).
+// The kernels (attention_plan.hpp); a 32-row wave's KV tile costs 0.83 of a 48-row one.
 static const host::Kernels kernels{{{fwd<2, false>, fwd<2, true>}, {fwd<3, false>, fwd<3, true>}}, 0.83f};
 static const host::Kernels paged_kernels{{{fwd<2, false, true>, fwd<2, true, true>},
                                           {fwd<3, false, true>, fwd<3, true, true>}}, 0.83f};

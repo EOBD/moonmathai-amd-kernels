@@ -1,6 +1,5 @@
-// Hand-issued gfx950 instructions, their scheduling rules, and lane views. A function named after an
-// instruction emits exactly that instruction; the asm ones also carry register operands that pin it
-// against compiler motion.
+// gfx950 instruction wrappers, scheduling rules and lane views. A wrapper named after an instruction emits
+// exactly that instruction.
 #pragma once
 
 #include "attention_config.hpp"
@@ -10,32 +9,30 @@
 #pragma clang diagnostic pop
 #include <type_traits>
 
-// Measured scheduling rules, cited in the kernels by tag:
-//   [mfma]    A 16x16x32 MFMA leaves the partner 2 VALU issue slots. An exp claims both, and one
-//             starting in the second slot pushes back the next MFMA.
-//   [pk]      Packed fp32 (v_pk_*_f32) gets no issue slot beside MFMAs.
-//   [salu]    SALU co-issues free, one op per exp; within the MFMA block it pushes the MFMAs back.
+// gfx950 rules, cited by tag:
+//   [mfma]    A 16x16x32 MFMA leaves the partner 2 VALU slots; an exp takes both (issued second, it delays the MFMA).
+//   [pk]      Packed fp32 (v_pk_*_f32) gets no issue slot beside an MFMA.
+//   [salu]    SALU co-issues freely beside exps (one per exp); inside the MFMA block it delays the MFMAs.
 //   [branch]  A taken branch costs about 20 cycles of instruction fetch.
-//   [vcc]     SALU reading a VALU compare (a ballot) waits roughly 24 cycles for it.
-//   [lds]     An LDS read directly behind the wave's own exp waits roughly 16-20 cycles for it.
-//   [dma]     A lone DMA instruction behind MFMAs hides its issue stall.
-//   [fence]   Scheduled as a unit, the MFMA block loses read-ahead: its steps become fenced.
-//   [lgkm]    Scalar loads share lgkmcnt with LDS reads and complete out of order: while one is in
-//             flight, every LDS wait becomes an lgkmcnt(0).
+//   [vcc]     SALU reading a VALU compare (ballot) waits about 24 cycles for it.
+//   [lds]     An LDS read right behind the wave's own exp waits about 16-20 cycles for it.
+//   [dma]     A DMA instruction alone behind MFMAs hides its issue stall.
+//   [fence]   The MFMA block scheduled as one unit loses its read-ahead: its steps are fenced.
+//   [lgkm]    Scalar loads share lgkmcnt with LDS reads and finish out of order: one in flight turns
+//             every LDS wait into lgkmcnt(0).
 
-// Every kernel lambda must be inlined: out-of-line, it spills the accumulators.
+// Kernel lambdas must inline; out of line they spill the accumulators.
 #define INLINE __attribute__((always_inline))
 
 namespace attn {
 
 // ---- lane views and notation --------------------------------------------------------------------
-// MFMA fragments of v_mfma_f32_16x16x32_bf16, with lane = 16g + l:
+// MFMA fragment layout of v_mfma_f32_16x16x32_bf16, lane = 16g + l:
 //   A[s] = A[m=l][k=8g+s]    B[s] = B[n=l][k=8g+s]    C[i] = C[m=4g+i][n=l]
-// Lane views: how a wave lays a tensor across its lanes. Each dim splits into sub-dims, major first;
-// P<n> sub-dims spread across lanes (or waves), Y<n> ones a single lane walks. A split is written as
-// "[kv][d] at [a, b][c, 8]": kv splits into a, b and d into c and 8. lane_view takes each dim's stride
-// and this lane's P coords; a Y coord y maps to offset .lane + .step(y).
-// For a [4][32] tile where the lane holds row lane/16 and columns lane%16 and 16 + lane%16:
+// Lane views: a tensor spread across a wave's lanes. Each dim splits into sub-dims, major first: P<n> spans
+// lanes (or waves), Y<n> is walked by one lane. "[kv][d] at [a, b][c, 8]": kv splits into a, b and d into c, 8.
+// lane_view takes each dim's stride and the lane's P coords; a Y coord y maps to offset .lane + .step(y).
+// A [4][32] tile, lane holding row lane/16 and columns lane%16 and 16 + lane%16:
 //   auto t = lane_view<xdim<P<4>>, xdim<Y<2>, P<16>>>(make_tuple(row_stride, 1_I), lane / 16, lane % 16);
 //   t(1) == (lane / 16) * row_stride + 16 + lane % 16
 using opus::operator""_I;
@@ -53,7 +50,7 @@ struct LaneView {
     template <class... Ys>
     __device__ constexpr auto step(Ys... y) const
     {
-        const auto zeros = opus::make_repeated_tuple<NumY - sizeof...(Ys)>(0_I);   // trailing y's default to zero
+        const auto zeros = opus::make_repeated_tuple<NumY - sizeof...(Ys)>(0_I);   // trailing Y coords default to zero
         return at_lane0(opus::concat_tuple(opus::make_tuple(y...), zeros));
     }
     template <class... Ys>
@@ -80,12 +77,11 @@ using lds_ptr_t        = __attribute__((address_space(3))) void*;
 using lds_addr_t       = const __attribute__((address_space(3))) bf16_t*;
 using lds_bf16x4_ptr_t = __attribute__((address_space(3))) bf16x4_t*;
 
-// A buffer resource as four words: base (48-bit, stride 0), byte range, config. D128 and paged K/V
-// carry these (paged: patched in place); MLA's contiguous K/V use the builtin __amdgpu_buffer_rsrc_t.
+// A buffer resource as words: base (48-bit, stride 0), byte range and config (paged K/V patch it in place).
 using rsrc_t = __attribute__((ext_vector_type(4))) uint32_t;
 
-// Global -> LDS DMA, 16 B per lane: lane L writes lds_dst + 16 L. As asm because the compiler would
-// wait on a builtin DMA before each LDS read; the kernels instead s_waitcnt_vmcnt, then barrier.
+// Global-to-LDS DMA, 16 B per lane: lane L writes lds_dst + 16 L. The kernels wait for it themselves (vmcnt,
+// then a barrier), not before each LDS read.
 template <class Rsrc>
 __device__ __forceinline__ void buffer_load_dwordx4_lds(Rsrc rsrc, lds_ptr_t lds_dst, uint32_t voffset,
                                                         uint32_t soffset)
@@ -96,8 +92,8 @@ __device__ __forceinline__ void buffer_load_dwordx4_lds(Rsrc rsrc, lds_ptr_t lds
                  :: "s"(m0), "v"(voffset), "s"(rsrc), "s"(soffset) : "memory");
 }
 
-// The same DMA split in two, with M0 written a step ahead of the load (no s_nop): set_m0(lds_dst),
-// then buffer_load_dwordx4_lds_m0, with no M0 write between. `after`: a register the load waits on.
+// The same DMA split in two, M0 set ahead (no s_nop): set_m0(lds_dst), then buffer_load_dwordx4_lds_m0 with no
+// M0 write between. `after`: the register the load is ordered after.
 __device__ __forceinline__ void set_m0(uint32_t lds_dst)
 {
     asm volatile("s_mov_b32 m0, %0" :: "s"(__builtin_amdgcn_readfirstlane(lds_dst)));
@@ -111,8 +107,7 @@ __device__ __forceinline__ void buffer_load_dwordx4_lds_m0(Rsrc rsrc, uint32_t v
                  "v"(after) : "memory");
 }
 
-// LDS reads from an LDS address: the compiler folds constant offsets into the instruction and inserts
-// the waits itself.
+// LDS reads; the compiler folds constant offsets and inserts the waits.
 __device__ __forceinline__ bf16x8_t ds_read_b128(lds_addr_t p)
 {
     return *reinterpret_cast<const __attribute__((address_space(3))) bf16x8_t*>(p);
@@ -123,7 +118,7 @@ __device__ __forceinline__ bf16x4_t ds_read_b64_tr_b16(lds_addr_t p)
     return __builtin_amdgcn_ds_read_tr16_b64_v4bf16((lds_bf16x4_ptr_t)p);
 }
 
-// Two fragments joined into one operand in consecutive registers.
+// Two fragments joined into one operand of consecutive registers.
 __device__ __forceinline__ bf16x8_t join(bf16x4_t a, bf16x4_t b)
 {
     return __builtin_shufflevector(a, b, 0, 1, 2, 3, 4, 5, 6, 7);
@@ -135,15 +130,14 @@ __device__ __forceinline__ bf16x16_t join(bf16x8_t a, bf16x8_t b)
 }
 
 // ---- barriers and waits -------------------------------------------------------------------------
-// At most N global loads / DMAs in flight. A wave's DMA reaches other waves only once the issuing
-// wave runs this wait and then a barrier.
+// At most N global loads / DMAs in flight. Other waves see a wave's DMA only after this wait and a barrier.
 template <int N>
 __device__ __forceinline__ void s_waitcnt_vmcnt()
 {
     asm volatile("s_waitcnt vmcnt(%0)" :: "n"(N) : "memory");
 }
 
-// Bare barrier: the kernels place their own DMA and LDS waits around it.
+// A bare barrier; the kernels place their own DMA and LDS waits around it.
 __device__ __forceinline__ void s_barrier()
 {
     asm volatile("s_barrier" ::: "memory");
@@ -169,15 +163,15 @@ __device__ __forceinline__ float max3(float a, float b, float c)
     return fmaxf(fmaxf(a, b), c);
 }
 
-// A single v_maximum3_f32: a NaN operand yields NaN (v_max3_f32 drops it), at the same speed. Operands
-// are MFMA results or maybe_nan's; a constant may be only a.
+// A single v_maximum3_f32: any NaN operand yields NaN. Operands are MFMA results or maybe_nan values; only a
+// may be a constant.
 __device__ __forceinline__ float maximum3(float a, float b, float c)
 {
     return __builtin_elementwise_maximum(__builtin_elementwise_maximum(a, b), c);
 }
 
-// x made opaque to LLVM. -ffast-math lets it assume a traceable non-NaN value: a max over such values
-// (maximum3's, constants) becomes a NaN-dropping v_max, and a NaN test on one folds away.
+// x made opaque to LLVM. -ffast-math then assumes a traceable non-NaN value: a max over such values
+// (maximum3 results, constants) lowers to a NaN-dropping v_max, and a NaN test on one folds away.
 __device__ __forceinline__ float maybe_nan(float x)
 {
     asm("" : "+v"(x));
@@ -190,22 +184,22 @@ __device__ __forceinline__ bool any_lane(bool x)
     return __builtin_amdgcn_ballot_w64(x) != 0;
 }
 
-// Lanes where x > y or x is NaN. A target compare: -ffast-math lowers !(x <= y) to x > y.
+// Lanes where x > y or x is NaN. A trick compare: -ffast-math lowers !(x <= y) to x > y.
 __device__ __forceinline__ uint64_t lanes_above_or_nan(float x, float y)
 {
-    constexpr int FcmpUgt = 10;                    // llvm CmpInst::FCMP_UGT: unordered-or-greater
+    constexpr int FcmpUgt = 10;                    // llvm CmpInst::FCMP_UGT (unordered-or-greater)
     return __builtin_amdgcn_fcmpf(x, y, FcmpUgt);
 }
 
-// Whether lanes includes any of row l's 4 lanes (l, l + 16, l + 32, l + 48).
+// Whether lanes holds any of row l's four lanes (l, l + 16, l + 32, l + 48).
 __device__ __forceinline__ bool has_row(uint64_t lanes, int l)
 {
     const uint32_t rows = (uint32_t)(lanes | lanes >> 32);
     return (rows | rows >> 16) >> l & 1;
 }
 
-// Whether x's bits are NaN or +inf. x must come from maybe_nan: otherwise LLVM folds the test (so does
-// v_cmp_class: under -ffast-math clang marks float arguments neither NaN nor Inf).
+// Whether x's bits are NaN or +inf. x must come from maybe_nan: otherwise LLVM folds the test (v_cmp_class
+// too: under -ffast-math clang marks a float argument neither NaN nor Inf).
 __device__ __forceinline__ bool nan_or_plus_inf(float x)
 {
     const uint32_t bits = __builtin_bit_cast(uint32_t, x);
@@ -222,9 +216,8 @@ __device__ __forceinline__ float opaque_float(uint32_t bits)
 __device__ __forceinline__ float opaque_nan() { return opaque_float(0x7FC00000u); }
 __device__ __forceinline__ float opaque_neg_inf() { return opaque_float(0xFF800000u); }
 
-// x[i] = max(x[i], x[i] of lane ^ 32), then lane ^ 16. The copies into early-clobber temps stop LLVM
-// folding a swap of a value with itself, and they go first: each swap reads a two-instruction-old
-// copy, covering the VALU write -> permlane read without an s_nop.
+// x[i] = max(x[i], x[i] of lane ^ 32), then lane ^ 16. Early-clobber copies keep the self-swap from
+// folding; issued first, they cover the VALU write -> permlane read hazard without an s_nop.
 __device__ __forceinline__ void max_lane_xor32(float (&x)[3])
 {
     float a = x[0], b = x[1], c = x[2], ta, tb, tc;
@@ -247,7 +240,7 @@ __device__ __forceinline__ void max_lane_xor16(float (&x)[3])
     x[0] = fmaxf(a, ta), x[1] = fmaxf(b, tb), x[2] = fmaxf(c, tc);
 }
 
-// Two values (QTiles 2), padded up to the 3-value asm.
+// Two values (QTiles 2) padded up to the 3-value asm.
 __device__ __forceinline__ void max_lane_xor32(float (&x)[2])
 {
     float y[3] = {x[0], x[1], x[0]};
@@ -260,13 +253,12 @@ __device__ __forceinline__ void max_lane_xor16(float (&x)[2])
     max_lane_xor16(y);
     x[0] = y[0], x[1] = y[1];
 }
-// The max over x, NaN if any is NaN (maximum3's rules: with two, MaskScore plays a).
+// The max over x, NaN if any x is NaN (maximum3's rules; with two values, MaskScore fills a).
 __device__ __forceinline__ float maximum_n(const float (&x)[3]) { return maximum3(x[0], x[1], x[2]); }
 __device__ __forceinline__ float maximum_n(const float (&x)[2]) { return maximum3(MaskScore, x[0], x[1]); }
 
-// A wave-uniform float in an SGPR. Written as asm because LLVM folds the builtin away and keeps a VGPR
-// copy. s_nop 1: a VALU write needs wait states before v_readfirstlane reads it, and LLVM adds none
-// ahead of asm.
+// A wave-uniform float in an SGPR (the builtin folds to a VGPR copy). s_nop 1 covers the VALU write ->
+// readfirstlane hazard; LLVM adds no wait states before asm.
 __device__ __forceinline__ float readfirstlane(float x)
 {
     float s;
@@ -275,7 +267,7 @@ __device__ __forceinline__ float readfirstlane(float x)
 }
 
 // ---- instruction scheduling ---------------------------------------------------------------------
-// sched_group's instruction classes.
+// __builtin_amdgcn_sched_group_barrier's instruction classes.
 constexpr int SchedValu = 0x002, SchedSalu = 0x004, SchedMfma = 0x008, SchedDsRead = 0x100,
               SchedTrans = 0x400;
 
@@ -285,38 +277,12 @@ __device__ __forceinline__ void sched_fence()
     __builtin_amdgcn_sched_barrier(0);
 }
 
-// The next N instructions of class Class, in sched_group call order.
-template <int Class, int N = 1>
-__device__ __forceinline__ void sched_group()
-{
-    __builtin_amdgcn_sched_group_barrier(Class, N, 0);
-}
-
-// N pairs: one class-A instruction, then one class-B instruction.
-template <int A, int B, int N>
-__device__ __forceinline__ void interleave()
-{
-    for (int i = 0; i < N; ++i) {
-        sched_group<A>();
-        sched_group<B>();
-    }
-}
-
-// NValu VALU instructions followed by NSalu SALU.
-template <int NValu, int NSalu>
-__device__ __forceinline__ void valu_then_salu()
-{
-    sched_group<SchedValu, NValu>();
-    sched_group<SchedSalu, NSalu>();
-}
-
-// A rare condition: its code moves out of line and the common path stays branch-free. Kept a macro
-// because inside a function __builtin_expect is lowered before inlining and does nothing.
+// A rare condition: its code goes out of line. A macro, because inside a function __builtin_expect is lost at
+// inlining.
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-// The compiler can move an MFMA across an asm barrier; an empty-asm data edge blocks it.
-// pin_before(x) keeps x's producers above, pin_after(x) keeps x's consumers below; being asm,
-// neither incurs an MFMA hazard wait.
+// Empty-asm data edges (MFMAs move across asm barriers): pin_before(x) keeps x's producers above,
+// pin_after(x) its consumers below; no MFMA hazard wait.
 template <class T>
 __device__ __forceinline__ void pin_before(const T& x)
 {
@@ -365,4 +331,4 @@ __device__ __forceinline__ int fresh_lane_id()
     return id;
 }
 
-}  // attn namespace
+}  // namespace attn
