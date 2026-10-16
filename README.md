@@ -292,9 +292,10 @@ both kernels against a dense reference that never sees the repacked weights.
   `opus/` their vendored opus.
 - `csrc/<arch>/*_api.cpp` — the torch bindings for each.
 - `moonmath_amd/` — Python package; `_arch.py` picks the module of the live GPU.
-- `Makefile` — direct kernel build (`make` produces root-level `.so` variants).
+- `Makefile` — direct kernel builds: `make` for the gfx942 `.so` variants, `make gfx950` for the CDNA4 C API library.
 - `benchmark/runner.py` — single-shape benchmark vs AITER and (optionally) Modular MAX.
 - `benchmark/bench_table.py` — multi-shape sweep with median-over-passes timing.
+- `benchmark/bench_gfx950.py` — the MI355X attention sweep against every AITER bf16 forward kernel.
 - `benchmark/bench_mla.py` — MLA decode vs AITER's a16w8 ASM kernel, CUDA-graph timed.
 - `benchmark/bench_moe.py` — MXFP4 MoE GEMMs vs AITER's Triton MXFP4 kernel.
 - `tests/test_mla_decode.py` — the MLA op against an fp32 reference built from the
@@ -381,12 +382,12 @@ python bench_table.py --benchmark-iters 30 --warmup-iters 8 --passes 5 --no-max
 ### Running the bench from scratch
 
 ```sh
-git clone https://github.com/moonmath-ai/cdna3-attention.git
-cd cdna3-attention
+git clone https://github.com/moonmath-ai/amd-kernels.git
+cd amd-kernels
 
 # python env (ninja is needed for AITER's JIT and our kernel build)
-conda create -n cdna3 python=3.11 ninja -y
-conda activate cdna3
+conda create -n moonmath-amd python=3.11 ninja -y
+conda activate moonmath-amd
 
 # install the package plus bench deps (torch, amd-aiter, numpy; max optional)
 pip install -e '.[bench]'
@@ -406,6 +407,47 @@ conda recipe above takes care of it.
 If `max` isn't installed (or you pass `--no-max`), runner skips the MAX row
 and prints a one-line "skipped" notice. MAX is initialized only after the
 HIP and AITER timing loops have finished, so its runtime cannot perturb them.
+
+### Results — attention forward, MI355X (gfx950), bf16
+
+`ma.forward` against the fastest AITER kernel per shape (v4, v3 or OPUS, in brackets). Speedup is
+`aiter_ms / ours_ms`. Same inputs, RTNE output on both sides; CUDA-graph timing, median of 7
+interleaved passes. Rel. error is max |out − ref| / max |ref| against fp32.
+
+| B, Hq/Hkv, Sq/Skv, Dqk/Dv | Causal | Ours (ms) | Fastest AITER (ms) | Speedup | Rel. error, ours / AITER |
+|---|---|---|---|---|---|
+| 1, 24, 4608, 128 | no | **0.1968** | 0.2155 (opus) | 1.10× | 2.8e-03 / 3.8e-03 |
+| 2, 24, 4096, 128 | no | **0.2937** | 0.3170 (v4) | 1.08× | 3.2e-03 / 3.6e-03 |
+| 1, 32, 16384, 128 | no | **3.210** | 3.275 (v4) | 1.02× | 2.6e-03 / 2.5e-03 |
+| 4, 16, 16384, 128 | no | **5.782** | 6.531 (v4) | 1.13× | 3.3e-03 / 3.1e-03 |
+| 2, 16, 65536, 128 | no | **45.99** | 51.89 (v4) | 1.13× | 2.6e-03 / 2.5e-03 |
+| 2, 24, 16384, 128 | no | **4.666** | 4.902 (v4) | 1.05× | 3.5e-03 / 3.7e-03 |
+| 1, 64, 16384, 128 | no | **5.785** | 6.537 (v4) | 1.13× | 2.8e-03 / 2.8e-03 |
+| 2, 24, 32768, 128 | no | **17.87** | 19.52 (v4) | 1.09× | 3.0e-03 / 3.0e-03 |
+| 2, 8, 86016, 128 | no | **38.84** | 44.69 (v4) | 1.15× | 3.1e-03 / 2.9e-03 |
+| 1, 16, 131072, 128 | no | **92.33** | 103.6 (v4) | 1.12× | 2.9e-03 / 3.0e-03 |
+| 1, 40, 32760, 128 | no | **14.73** | 16.31 (v4) | 1.11× | 3.4e-03 / 3.1e-03 |
+| 1, 40, 75600, 128 | no | **75.45** | 86.92 (v4) | 1.15× | 2.8e-03 / 2.8e-03 |
+| 1, 24, 119056, 128 | no | **114.5** | 129.0 (v4) | 1.13× | 3.3e-03 / 3.2e-03 |
+| 1, 24, 4097, 128 | no | **0.1737** | 0.1859 (opus) | 1.07× | 3.2e-03 / 5.3e-03 |
+| 1, 64/8, 8192, 128 | no | **1.538** | 1.656 (v4) | 1.08× | 3.1e-03 / 3.2e-03 |
+| 4, 32/8, 4096, 128 | no | **0.7841** | 0.8461 (v4) | 1.08× | 3.7e-03 / 3.4e-03 |
+| 2, 24, 8192/512, 128 | no | **0.1125** | 0.1165 (v4) | 1.04× | 3.2e-03 / 3.0e-03 |
+| 1, 32, 8192, 128 | yes | **0.4089** | 0.4734 (v3) | 1.16× | 1.3e-03 / 1.3e-03 |
+| 1, 64/8, 16384, 128 | yes | **2.926** | 3.456 (opus) | 1.18× | 7.4e-04 / 8.8e-04 |
+| 4, 32, 4096, 128 | yes | **0.4497** | 0.5113 (opus) | 1.14× | 1.2e-03 / 1.5e-03 |
+| 2, 16, 8192, 192/128 | no | **1.026** | 1.038 (opus) | 1.01× | 3.3e-03 / 3.3e-03 |
+| 1, 128, 8192, 192/128 | yes | 2.276 | **2.273** (opus) | 1.00× | 1.8e-03 / 1.8e-03 |
+| 4, 16, 4096, 192/128 | yes | **0.3110** | 0.3168 (opus) | 1.02× | 1.1e-03 / 1.1e-03 |
+| _geomean_ | | | | _1.09×_ | |
+
+MI355X VF (clocks not locked), ROCm 7.13, PyTorch 2.11, AITER
+[`578df29d7`](https://github.com/ROCm/aiter/commit/578df29d7026e813b33992fcb971bc184c82abcb).
+Differences of 1–2% are noise.
+
+```sh
+python benchmark/bench_gfx950.py --markdown
+```
 
 ### Results — MLA decode, MI300X, bf16 Q / fp8 KV, H = 16, q\_len = 4
 
