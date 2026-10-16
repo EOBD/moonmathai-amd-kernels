@@ -396,13 +396,14 @@ namespace host {
 // ---- host: the planner --------------------------------------------------------------------------
 // CTAs go round-robin to the 8 XCDs (one L2 each); an XCD starts its CTAs in list order on the first free CU.
 // A round: one CTA per CU. A unit: one sequence's head pack (one KV head). The rules:
-//   split  A grid of at most SplitMaxRounds rounds takes the fastest of: q blocks whole, or split to fill
-//          k = 1 .. SplitMaxRounds rounds; 48-row waves, then 32. A later candidate must win by SplitMinGain.
+//   split  The fastest of: q blocks whole, or split to fill k = 1 .. SplitMaxRounds rounds (grids that fit
+//          them); 48-row waves, then 32. A later candidate must win by SplitMinGain.
 //   fill   Per round, the q block with the longest parts gains a part (at most MaxParts, one tile each).
 //   align  At AlignRounds or more rounds, an n-way split cuts at multiples of the longest part w if every
 //          last part keeps w / 2: a head's parts run in step and share K/V in L2.
 //   time   Modelled dispatch, longest first on the first free CU. A CTA costs its KV tiles (fewer wave rows:
 //          q2_tile_cost) plus CtaTiles (a part: PartTiles); a part adds MergeTiles of merge over all CUs.
+//          A part anywhere, or LSEs, runs every CTA on the Split=true kernels: tiles cost split_tile_cost.
 //   order  Longest first. If the list's eighths carry equal work, XCD x takes eighth x, in groups of the
 //          units whose K/V fits LptBytes (at most MaxLptUnits; a split grid is one group); else round-robin.
 //   dev    Dev mode: wave rows and P by split's rule on a stand-in call; P > 1 only within DevSplitRounds
@@ -430,6 +431,8 @@ struct Problem {
     int kv_bytes;                   // K + V bytes per key of one KV head
     float q2_tile_cost = 1.0f;      // a KV tile of the fewer wave rows, in tiles of the more
     int rows = MaxWaveRows;         // wave rows, chosen by plan_split
+    float split_tile_cost[2] = {1.0f, 1.0f};    // a KV tile on the Split=true kernels, by rows / 16 - 2
+    bool lse = false;               // the call returns LSEs
 };
 
 // For every sequence and q block: its KV tiles, or its parts.
@@ -451,7 +454,10 @@ inline double modelled_time(const Problem& p, const PerBlock& tiles, const PerBl
                             double limit)
 {
     // 1. The CTAs as (cost, count), plus the merge cost; the bound is the longest CTA or the mean.
-    const double tile = p.rows == MaxWaveRows ? 1.0 : p.q2_tile_cost;
+    bool split = p.lse;
+    for (const auto& s : parts) split = split || std::any_of(s.begin(), s.end(), [](int n) { return n > 1; });
+    const double tile = (p.rows == MaxWaveRows ? 1.0 : p.q2_tile_cost) *
+                        (split ? p.split_tile_cost[p.rows / 16 - 2] : 1.0);
     const int packs = p.H / p.pack;
     std::vector<std::pair<double, long long>> ctas;
     double merge = 0, work = 0, longest = 0;
@@ -495,7 +501,7 @@ inline PerBlock plan_split(Problem& p, int n_cu, bool allow_split)
         p.rows = rows[r], tiles[r] = all_tiles(p);
         for (const auto& t : tiles[r])
             parts[r].emplace_back(t.size(), 1), ctas[r] += (long long)t.size() * packs;
-        if (r == 0 && (n_cu <= 0 || ctas[0] > (long long)SplitMaxRounds * n_cu)) return parts[0];
+        if (n_cu <= 0) return parts[0];
         for (size_t s = 0; s < tiles[r].size(); ++s)
             for (size_t b = 0; b < tiles[r][s].size(); ++b) longest[r].push({tiles[r][s][b], (int)s, (int)b});
     }
@@ -842,8 +848,8 @@ inline Staged* stage(StreamState& st, std::vector<int> key, Plan plan, int dev, 
 
 // ---- host: launches -----------------------------------------------------------------------------
 // A head dim's kernels fwd[r][split] for wave rows 32 and 48 (r = rows / 16 - 2; split: plans with parts
-// or LSEs), and a 32-row wave's KV tile cost in 48-row tiles.
-struct Kernels { void (*fwd[2][2])(Args); float q2_tile_cost; };
+// or LSEs), a 32-row wave's KV tile cost in 48-row tiles, and a tile's cost on fwd[r][true] over fwd[r][false].
+struct Kernels { void (*fwd[2][2])(Args); float q2_tile_cost; float split_tile_cost[2]; };
 
 // The split workspace: part_o first, then part_ml; a part holds BlockM rows.
 template <int Dv>
@@ -897,22 +903,24 @@ int launch_captured(Kernels k, Args a, const Problem& p, int dev, StreamState& s
 template <int Dqk, int Dv>
 Problem problem(Kernels k, int H, int HKv, int causal)
 {
-    return {{}, H, HKv, causal, causal ? H / HKv : 1, (Dqk + Dv) * (int)sizeof(bf16_t), k.q2_tile_cost};
+    return {{}, H, HKv, causal, causal ? H / HKv : 1, (Dqk + Dv) * (int)sizeof(bf16_t), k.q2_tile_cost,
+            MaxWaveRows, {k.split_tile_cost[0], k.split_tile_cost[1]}};
 }
 
 // Launch a call (host mode) from the stream's matching slot, or a newly staged plan.
 template <int Dqk, int Dv>
-int launch(Kernels k, Args a, const Problem& p, hipStream_t stream)
+int launch(Kernels k, Args a, Problem p, hipStream_t stream)
 {
     const int dev = current_device();
     if (dev < 0) return -1;
+    p.lse = a.lse != nullptr;
     std::lock_guard<std::mutex> lock(state_mutex);    // until the kernels are queued
     const int n_cu = cu_count(dev);
     StreamState& st = streams[dev][state_key(stream)];
     if (capturing(stream)) return launch_captured<Dv>(k, a, p, dev, st, stream);
 
     // 1. The plan and its device list.
-    std::vector<int> key{Dqk, Dv, p.H, p.HKv, p.causal};
+    std::vector<int> key{Dqk, Dv, p.H, p.HKv, p.causal, p.lse};
     for (const Seq& s : p.seqs) key.insert(key.end(), {s.b, s.q0, s.sq, s.kv0, s.skv});
     const Staged* s = std::find_if(st.staged, st.staged + StagingSlots,
                                    [&](const Staged& x) { return x.key == key; });
