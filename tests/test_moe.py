@@ -1,19 +1,26 @@
-"""MXFP4 MoE GEMMs against a dense torch reference.
+"""MXFP4 MoE GEMMs vs a dense torch reference.
 
-The reference dequantizes the STOCK weight layout and uses a plain matmul, so
-it shares no code with the repack the kernels consume -- a bug in the repack
-cannot hide behind a matching bug in the reference.
+The reference dequantizes the STOCK weight layout and uses a plain matmul, so it
+shares no code with the repack the kernels consume: a bug in the repack cannot
+hide behind a matching bug in the reference.
 """
 
 import pytest
 import torch
 
 import moonmath_amd as ma
+from moonmath_amd import _arch
 
-#  E2M1: sign bit plus a 3-bit magnitude index into these values.
+# gfx942-only kernels: skip when this build lacks the module or the GPU is not CDNA3.
+pytestmark = pytest.mark.skipif(
+    not _arch.is_built("gfx942") or (torch.cuda.is_available() and _arch.get_gfx_runtime() != "gfx942"),
+    reason="needs moonmath_amd._C_gfx942 and a gfx942 GPU",
+)
+
+#  E2M1: sign bit plus a 3-bit magnitude index selecting one of these values.
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
-#  Kimi-K3 TP8 shard, which is the shape these kernels are tuned for.
+#  Kimi-K3 TP8 shard: the shape these kernels are tuned for.
 E, H, INTER, TOPK = 64, 3584, 384, 8
 
 
@@ -25,18 +32,18 @@ def device():
 
 
 def _dequant(B, Bs):
-    """[E, N, K/2] uint8 + [E, N, K/32] uint8 -> [E, N, K] float32, stock layout."""
+    """[E, N, K/2] uint8 + [E, N, K/32] uint8 -> [E, N, K] float32 in stock layout."""
     e, n, kh = B.shape
     tbl = torch.tensor(E2M1 + [-v for v in E2M1], dtype=torch.float32, device=B.device)
-    lo = tbl[(B & 0x0F).long()]                       # even k
-    hi = tbl[(B >> 4).long()]                         # odd k
+    lo = tbl[(B & 0x0F).long()]                       # even-k nibble
+    hi = tbl[(B >> 4).long()]                         # odd-k nibble
     vals = torch.stack([lo, hi], dim=-1).reshape(e, n, kh * 2)
     scale = torch.exp2(Bs.to(torch.float32) - 127.0).repeat_interleave(32, dim=2)
     return vals * scale
 
 
 def _align(topk_ids, block_m, num_experts):
-    """The usual moe_align_block_size: sort rows by expert, pad each to block_m."""
+    """A standard moe_align_block_size: sort rows by expert, pad each group to block_m."""
     flat = topk_ids.flatten()
     order = torch.argsort(flat.float(), stable=True)
     sorted_experts = flat[order]
@@ -68,17 +75,17 @@ def _route(T, n_active, device, seed):
 def _weights(n, k, device, seed):
     g = torch.Generator(device=device).manual_seed(seed)
     B = torch.randint(0, 256, (E, n, k // 2), dtype=torch.uint8, device=device, generator=g)
-    #  A narrow exponent band keeps the reference matmul away from fp32 overflow
-    #  while still exercising a different scale in most 32-k groups.
+    #  A narrow exponent band keeps the reference matmul clear of fp32 overflow
+    #  yet still gives most 32-k groups a distinct scale.
     Bs = torch.randint(120, 134, (E, n, k // 32), dtype=torch.uint8, device=device, generator=g)
     return B, Bs
 
 
 def _reference(A, W, sorted_ids, expert_ids, block_m, rows, N, top_k):
-    """Dense reference over the same padded block list the kernel walks.
+    """Dense oracle over the same padded block list the kernel walks.
 
     The kernel reads ``A[slot // top_k]`` and writes ``C[slot]``: gate/up takes
-    per-TOKEN activations with top_k = TOPK, down takes per-(token, expert)
+    per-TOKEN activations with top_k = TOPK, while down takes per-(token, expert)
     rows with top_k = 1.
     """
     out = torch.zeros(rows, N, dtype=torch.float32, device=A.device)
@@ -103,7 +110,7 @@ def test_gateup_epi_none(device, T, n_active):
     B, Bs = _weights(INTER, H, device, seed=11)
     Br, Bsr = ma.repack_mxfp4(B), ma.repack_mxfp4_scales(Bs)
 
-    #  gate/up consumes per-TOKEN hidden states and fans them out over top_k.
+    #  gate/up takes per-TOKEN hidden states and fans them out across top_k.
     A = (torch.randn(T, H, device=device, dtype=torch.bfloat16) * 0.1)
     C = torch.zeros(rows, INTER, device=device, dtype=torch.bfloat16)
 
@@ -128,8 +135,8 @@ def test_down(device, T, n_active):
     B, Bs = _weights(H, INTER, device, seed=17)
     Br, Bsr = ma.repack_mxfp4(B), ma.repack_mxfp4_scales(Bs)
 
-    #  down consumes the gate/up output, which is already one row per
-    #  (token, expert) pair, so its top_k is 1.
+    #  down consumes the gate/up output, already one row per (token, expert)
+    #  pair, hence its top_k is 1.
     A = (torch.randn(rows, INTER, device=device, dtype=torch.bfloat16) * 0.1)
     C = torch.zeros(rows, H, device=device, dtype=torch.bfloat16)
 
@@ -150,7 +157,7 @@ def test_down(device, T, n_active):
 
 
 def _situ_glu(g, u, beta, linear_beta):
-    """Kimi-K3 SituGLU, using tanh(x) = 2*sigmoid(2x) - 1 as the kernel does."""
+    """Kimi-K3 SituGLU; uses tanh(x) = 2*sigmoid(2x) - 1, matching the kernel."""
     tg = 2.0 * torch.sigmoid(2.0 * g / beta) - 1.0
     tu = 2.0 * torch.sigmoid(2.0 * u / linear_beta) - 1.0
     return (beta * tg * torch.sigmoid(g)) * (linear_beta * tu)
@@ -158,8 +165,8 @@ def _situ_glu(g, u, beta, linear_beta):
 
 @pytest.mark.parametrize("T,n_active", [(64, 48), (256, 64)])
 def test_gateup_situ(device, T, n_active):
-    """The fused epilogue: B carries gate in columns [0, INTER) and up in
-    [INTER, 2*INTER), and C comes back INTER wide."""
+    """The fused epilogue: B holds gate in columns [0, INTER) and up in
+    [INTER, 2*INTER), while C is written INTER wide."""
     rows = T * TOPK
     beta, linear_beta = 4.0, 25.0
     B, Bs = _weights(2 * INTER, H, device, seed=13)
@@ -187,8 +194,8 @@ def test_gateup_situ(device, T, n_active):
 
 @pytest.mark.parametrize("n_steps", [1, 2, 3, 7, 14])
 def test_down_n_steps_does_not_change_the_result(device, n_steps):
-    """`n_steps` is a scheduling knob -- how many column chunks one workgroup
-    sweeps against its staged A tile -- so every legal value must agree."""
+    """`n_steps` is a scheduling knob: how many column chunks a workgroup sweeps
+    against its staged A tile. Every legal value must therefore agree."""
     T, n_active = 64, 48
     rows = T * TOPK
     B, Bs = _weights(H, INTER, device, seed=17)
@@ -213,32 +220,32 @@ def test_down_n_steps_does_not_change_the_result(device, n_steps):
 
 
 def test_down_plan_widens_the_thin_decode_grid():
-    """At decode the m-blocks are about the live expert count, so one chunk per
-    workgroup leaves the A stage unamortised. The rule is off where the grid is
-    too thin to give the columns up."""
+    """At decode the m-block count tracks the live experts, so a single chunk per
+    workgroup leaves the A stage unamortized. The rule stays off where the grid
+    is too thin to surrender its columns."""
     assert ma.mxfp4_moe_down_n_steps(384, H, 304, 16, 1) >= 4
     assert ma.mxfp4_moe_down_n_steps(48, H, 32, 16, 2) >= 3
     assert ma.mxfp4_moe_down_n_steps(48, H, 304, 16, 2) == 1
 
 
 def test_repack_is_a_permutation(device):
-    """The repack must move bytes, never change values.
+    """The repack must only move bytes, never alter values.
 
-    The one exception is MXFP4's negative zero: nibble 0x8 comes out as 0x0, so
-    the magnitude nibble stays a plain table index. That changes the sign of a
-    zero and nothing else, so the comparison below is on magnitudes.
+    MXFP4's negative zero is the sole exception: nibble 0x8 emerges as 0x0, keeping
+    the magnitude nibble a plain table index. Only the sign of a zero changes, so
+    the comparisons below work on magnitudes.
     """
     B, Bs = _weights(64, 512, device, seed=23)
     Br, Bsr = ma.repack_mxfp4(B), ma.repack_mxfp4_scales(Bs)
 
     assert Br.shape == (E, 512 // 32, 64, 16)
     assert Bsr.shape == (E, 512 // 32, 64)
-    #  Same multiset of magnitudes, and the scales are a pure transpose.
+    #  Same multiset of magnitudes; the scales are a pure transpose.
     assert torch.equal(torch.bincount((B & 0x07).flatten(), minlength=8)
                        + torch.bincount(((B >> 4) & 0x07).flatten(), minlength=8),
                        torch.bincount((Br & 0x07).flatten(), minlength=8)
                        + torch.bincount(((Br >> 4) & 0x07).flatten(), minlength=8))
-    #  Every sign survives except the ones sitting on a zero.
+    #  Every sign survives except signs attached to a zero.
     def _signs(x):
         nz = (x & 0x07) != 0
         return torch.bincount((x >> 3)[nz].flatten(), minlength=2)
@@ -248,7 +255,7 @@ def test_repack_is_a_permutation(device):
 
 
 def test_rejects_unrepacked_weights(device):
-    """A stock-layout B has the wrong rank, and must be refused rather than run."""
+    """A stock-layout B has the wrong rank and must be rejected, not executed."""
     rows = 64
     B, Bs = _weights(INTER, H, device, seed=29)
     A = torch.zeros(rows // TOPK, H, device=device, dtype=torch.bfloat16)

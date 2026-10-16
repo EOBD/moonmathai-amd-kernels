@@ -8,7 +8,7 @@ each stranded q-block's kv work `G` ways across all CUs (FlashDecoding-style),
 exporting fp32 (o,m,l) partials and merging them.
 
 This reproduces, in pure host arithmetic, exactly what `plan_tail_split` in
-`csrc/attention_kernel.hip` decides — the enable guards, the `G` search, and the
+`csrc/gfx942/attention_kernel.hip` decides — the enable guards, the `G` search, and the
 resulting wall-time model — so you can see whether a shape benefits *before*
 running it. It is the structural ceiling: it models KV-block wall-time only and
 ignores fixed per-CTA cost, the v_transpose precompute, and launch latency, so
@@ -22,11 +22,11 @@ measured gains land at or just under it.
 import argparse
 import math
 
-# Kernel constants (keep in sync with csrc/attention_kernel.hip).
-QBLOCK_ROWS = 384  # QTilesPerWG(24) * QTileRows(16)
-KV_BLOCK = 64  # KvBlockRows
-NUM_CUS = 304  # NumCUs
-MAX_PARTS = 2 * NUM_CUS  # 608
+# Kernel constants (mirror csrc/gfx942/attention_kernel.hip).
+QBLOCK_ROWS = 384  # QTilesPerWG(24) × QTileRows(16)
+KV_BLOCK = 64  # kernel's KvBlockRows
+NUM_CUS = 304  # kernel's NumCUs
+MAX_PARTS = 2 * NUM_CUS  # = 2 × NumCUs
 MERGE_CONST = 3  # the "+3" merge proxy in the span model
 
 
@@ -38,10 +38,10 @@ def plan_tail(B, S, H, Skv=None):
     factor G beats running the full stranded round.
     """
     Skv = Skv or S
-    nqb = math.ceil(S / QBLOCK_ROWS)  # q-blocks per (B,H) = CTAs/head
-    nkb = math.ceil(Skv / KV_BLOCK)  # kv blocks
+    nqb = math.ceil(S / QBLOCK_ROWS)  # q-blocks per (B,H), i.e. CTAs per head
+    nkb = math.ceil(Skv / KV_BLOCK)  # KV blocks
     wgs = nqb * B * H  # total CTAs
-    rounds, tail = divmod(wgs, NUM_CUS)  # full CU-rounds, stranded CTAs
+    rounds, tail = divmod(wgs, NUM_CUS)  # full CU rounds, then stranded CTAs
     info = dict(nqb=nqb, nkb=nkb, wgs=wgs, rounds=rounds, tail=tail, G=1, gain=1.0)
 
     if tail == 0 or tail > NUM_CUS * 19 // 20 or nkb < 48:
@@ -56,7 +56,7 @@ def plan_tail(B, S, H, Skv=None):
     def span(g):
         return math.ceil(tail * g / NUM_CUS) * math.ceil(nkb / g) + MERGE_CONST
 
-    best_g, best_span = 1, nkb + MERGE_CONST  # g=1 = the no-split baseline
+    best_g, best_span = 1, nkb + MERGE_CONST  # g=1 is the no-split baseline
     g_hi = min(MAX_PARTS // tail, nkb // 4)
     for g in range(2, g_hi + 1):
         s = span(g)
@@ -67,7 +67,7 @@ def plan_tail(B, S, H, Skv=None):
         info["reason"] = "no split factor beats the full stranded round"
         return info
 
-    # Wall-time model: no-split = (rounds+1) full streams; split = rounds + span(G).
+    # Wall-time model: no-split = (rounds+1) full streams, split = rounds + span(G).
     gain = (rounds + 1) * nkb / (rounds * nkb + best_span)
     info.update(G=best_g, span=best_span, gain=gain, reason="split")
     return info

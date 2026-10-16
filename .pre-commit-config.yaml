@@ -30,11 +30,13 @@ repos:
     rev: v20.1.7
     hooks:
       - id: clang-format
-        # `.hip` is not auto-detected as C++/CUDA by `identify`, so override the
-        # hook's default type filter and select files via the `files` regex.
+        # `identify` doesn't auto-detect `.hip` as C++/CUDA, so bypass the hook's
+        # default type filter and match files with the `files` regex instead.
         files: ^csrc/.*\.(cpp|hpp|hip)$
+        # gfx950 kernels use their own style, mirroring the cdna4-attn sources.
+        exclude: ^csrc/gfx950/(attention(_mla|_config|_prims|_plan)?\.(hip|hpp|h)|opus/.*)$
         types_or: [file]
-        # Autoformat: rewrite the files in place to match .clang-format.
+        # Formatting: rewrite files in place per .clang-format.
         args: [-i, --style=file]
   - repo: local
     hooks:

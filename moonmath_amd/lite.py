@@ -30,9 +30,9 @@ skip list and flips the read/write role each step.
 
 import torch
 
-from . import _kernel
+from . import _arch, _kernel
 
-# Kernel tile geometry (3q CTA = 8 waves × QTilesPerWave=3 × 16 rows = 384 q-rows; KvBlockRows=64).
+# Tile geometry: a 3q CTA is 8 waves × 3 q-tiles × 16 rows = 384 q-rows wide; KvBlockRows=64.
 KBLOCK_M = 384
 KBLOCK_N = 64
 
@@ -71,14 +71,14 @@ class LiteAttention:
         self.threshold = float(threshold)
         self.enable_skipping = bool(enable_skipping)
         self.round_mode = round_mode
-        self.layout = layout  # "bhsd" [B,H,S,D] or "bshd" [B,S,H,D]
+        self.layout = layout  # storage order: "bhsd" [B,H,S,D] or "bshd" [B,S,H,D]
         self._skip = (
-            None  # [2, B, H, qtiles, ktiles+2] int16 (read/write double buffer)
+            None  # int16 double buffer [2, B, H, qtiles, ktiles+2] (read/write)
         )
         self._phase = 0
-        self._sig = None  # (B, H, Sq, Skv, device) reinit signature
+        self._sig = None  # signature (B, H, Sq, Skv, device) that forces a reinit
 
-    # tile sizes (LiteAttention API parity)
+    # fixed tile sizes, matching the LiteAttention API
     @staticmethod
     def get_MN(head_dim=128, dtype=torch.bfloat16, v_colmajor=False):
         return KBLOCK_M, KBLOCK_N
@@ -108,18 +108,18 @@ class LiteAttention:
     def _ensure(self, q, k):
         sax, hax = (1, 2) if self.layout == "bshd" else (2, 1)
         B, H, Sq, D = q.shape[0], q.shape[hax], q.shape[sax], q.shape[3]
-        Skv = k.shape[sax]  # cross-attn: K/V len may differ from Q
+        Skv = k.shape[sax]  # cross-attention: K/V length can differ from Q
         sig = (B, H, Sq, Skv, q.device)
         if self._skip is not None and self._sig == sig:
             return
         qtiles = _ceil_div(
             Sq, KBLOCK_M
-        )  # == kernel's num_q_blocks (one RLE row per CTA)
-        ktiles = _ceil_div(Skv, KBLOCK_N)  # skip-list is over K-blocks
+        )  # equals the kernel's num_q_blocks (one RLE row per CTA)
+        ktiles = _ceil_div(Skv, KBLOCK_N)  # the skip list is indexed by K-blocks
         skip = torch.zeros(
             2, B, H, qtiles, ktiles + 2, dtype=torch.int16, device=q.device
         )
-        # Compute-all reverse seed (skip_list.h init, phase 1 ascending): [2, ktiles-1, -1].
+        # Seed with the compute-all reverse list (skip_list.h init, phase 1 ascending): [2, ktiles-1, -1].
         skip[0, :, :, :, 0] = 2
         skip[0, :, :, :, 1] = ktiles - 1
         skip[0, :, :, :, 2] = -1
@@ -131,15 +131,16 @@ class LiteAttention:
         return self.forward(q, k, v, out=out, must_do_list=must_do_list)
 
     def forward(self, q, k, v, *, out=None, must_do_list=None):
-        # `must_do_list` (optional int16 [len, s0,e0, ...]): K-block ranges pinned as
-        # always-compute in the emitted write list (e.g. attention sinks). None ⇒ pure vote.
+        # `must_do_list` (optional int16 [len, s0,e0, ...]): K-block ranges forced to
+        # always-compute in the emitted write list (e.g. attention sinks). None ⇒ vote only.
+        _arch.require_gfx942("LiteAttention", q.device if q.is_cuda else None)
         if not self.enable_skipping:
             return _kernel.forward(
                 q, k, v, out=out, round_mode=self.round_mode, layout=self.layout
             )
         self._ensure(q, k)
-        # Swap read/write role, then pass the post-swap phase to the kernel (== LiteAttention).
-        # Each CTA processes its read list's kept blocks and writes the next-step list inline.
+        # Flip read/write roles, then hand the post-swap phase to the kernel (== LiteAttention).
+        # Each CTA walks its read list's kept blocks and writes the next-step list inline.
         read, write = self._skip[self._phase], self._skip[1 - self._phase]
         self._phase = 1 - self._phase
         ret = _kernel.forward_lite(
@@ -162,7 +163,7 @@ class LiteAttention:
 
                 w = self._skip[
                     1 - self._phase
-                ]  # the list just written (becomes next read)
+                ]  # the freshly written list (next step's read list)
                 row = w[0, 0, 0].tolist()
                 ls = 1 if self._phase else -1
                 ln = int(row[0])

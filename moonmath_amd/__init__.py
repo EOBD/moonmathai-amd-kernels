@@ -1,14 +1,16 @@
-"""Hand-tuned kernels for AMD CDNA3 (MI300X / gfx942).
+"""Hand-tuned kernels for AMD CDNA3 (MI300X / gfx942) and CDNA4 (MI355X / gfx950).
+
+Every op dispatches on the live GPU's architecture; see moonmath_amd._arch.
 
 >>> import torch
 >>> import moonmath_amd as ma
->>> q = torch.randn(1, 4, 1024, 128, dtype=torch.bfloat16)
->>> k = torch.randn(1, 4, 1024, 128, dtype=torch.bfloat16)
->>> v = torch.randn(1, 4, 1024, 128, dtype=torch.bfloat16)
->>> out = ma.forward(q, k, v)         # torch.bfloat16, same shape
+>>> q = torch.randn(1, 1024, 4, 128, dtype=torch.bfloat16)   # shape [B, S, H, D]
+>>> k = torch.randn(1, 1024, 4, 128, dtype=torch.bfloat16)
+>>> v = torch.randn(1, 1024, 4, 128, dtype=torch.bfloat16)
+>>> out = ma.forward(q, k, v, layout="bshd")   # bf16 result, same shape
 """
 
-from ._kernel import forward, forward_lite
+from ._kernel import VarlenPlan, forward, forward_lite, forward_paged, forward_varlen
 from .lite import LiteAttention
 from .mla import (
     mla_dcp_lse_merge_ranks,
@@ -30,7 +32,7 @@ from .moe import (
 )
 
 __all__ = [
-    "forward", "forward_lite", "LiteAttention",
+    "forward", "forward_lite", "forward_varlen", "forward_paged", "VarlenPlan", "LiteAttention",
     "mla_decode_a16w8", "mla_dcp_lse_merge_ranks",
     "repack_mxfp4", "repack_mxfp4_scales",
     "mxfp4_moe_gateup", "mxfp4_moe_down",
