@@ -674,10 +674,12 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
 // ---- the C API, declared in attention.h -------------------------------------------------------
 using namespace attn;
 
-// The kernels (attention_plan.hpp); a 32-row wave's KV tile costs 0.83 of a 48-row one.
-static const host::Kernels kernels{{{fwd<2, false>, fwd<2, true>}, {fwd<3, false>, fwd<3, true>}}, 0.83f};
+// The kernels (attention_plan.hpp); a 32-row wave's KV tile costs 0.74 of a 48-row one, and a Split=true
+// kernel's tile 1.01 (32 rows) and 1.09 (48 rows) of its Split=false one's.
+static const host::Kernels kernels{{{fwd<2, false>, fwd<2, true>}, {fwd<3, false>, fwd<3, true>}}, 0.74f,
+                                   {1.01f, 1.09f}};
 static const host::Kernels paged_kernels{{{fwd<2, false, true>, fwd<2, true, true>},
-                                          {fwd<3, false, true>, fwd<3, true, true>}}, 0.83f};
+                                          {fwd<3, false, true>, fwd<3, true, true>}}, 0.74f, {1.01f, 1.09f}};
 
 extern "C" int cdna4_attn_fwd_bf16_strided(const void* q, const void* k, const void* v, void* o, float* lse,
                                            const int64_t* strides, int B, int H, int HKv, int Sq, int Skv,
