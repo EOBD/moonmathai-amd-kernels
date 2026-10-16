@@ -119,7 +119,7 @@ __device__ __forceinline__ unsigned bf16_round_one(float f) {
           "v_bfe_u32 %1, %2, 16, 1\n"
           "v_add3_u32 %1, %2, %1, %3\n"
           "v_cndmask_b32 %2, %1, %4, %0"
-          : "=s"(nan_mask), "=v"(tmp), "+v"(u_bits)
+          : "=s"(nan_mask), "=&v"(tmp), "+v"(u_bits)
           : "v"(0x7FFFu), "v"(0x7FFF0000u));
       return u_bits;
     } else {
@@ -252,7 +252,7 @@ buffer_load_b32_to_lds(__amdgpu_buffer_rsrc_t buffer, uint32_t lds_dest, uint32_
       "buffer_load_dword %1, %2, %3 offen lds"
       :
       : "s"(lds_dest), "v"(voff), "s"(buffer), "s"(soff)
-      : "memory");
+      : "m0", "memory");
 }
 
 // ─── Cross-lane reductions ───────────────────────────────────────────────────
@@ -491,7 +491,7 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   const int lane = tid & 63;
   const int col = lane & 15;   // q-col / kv-row within a 16-wide tile
   const int quad = lane >> 4;  // which group of 4 lanes (0..3)
-  const bool group_a = (wave_id < LoadWaves);
+  const bool group_a = (int)to_scalar((uint32_t)wave_id) < LoadWaves;  // SGPR → scalar branches
   const int wave_in_group = group_a ? wave_id : (wave_id - LoadWaves);
 
   // K-LDS XOR swizzle (stride-64, bank-conflict-free), matches direct_lds_k's HBM-source swizzle. Read-offset fields
@@ -930,17 +930,22 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   // sink, LAST op before end-of-iter wait_vmcnt0.
   auto prefetch_v_t_l1 = [&](int kv_iter_next) {
     if (kv_iter_next < 0) return;
+    static_assert(VtChunks / LoadWaves == 4, "prefetch asm below issues exactly 4 loads");
+    uint32_t off[4];
 #pragma unroll
-    for (int i = 0; i < VtChunks / LoadWaves; ++i) {
-      const int chunk = VtPrefetch(wave_in_group, i);
-      const uint32_t chunk_off = (uint32_t)(VtLayout(kv_iter_next, chunk, lane) * 2);
-      // v[140:143] = discard sink (L1-fill side effect only; data never read). A fixed GPR keeps it out of the
-      // allocator's live set.
-      asm volatile("buffer_load_dwordx4 v[140:143], %0, %1, 0 offen"
-                   :
-                   : "v"(chunk_off), "s"(v_buffer)
-                   : "v140", "v141", "v142", "v143", "memory");
-    }
+    for (int i = 0; i < 4; ++i)
+      off[i] = (uint32_t)(VtLayout(kv_iter_next, VtPrefetch(wave_in_group, i), lane) * 2);
+    // v[140:143] = discard sink (L1-fill side effect only). The vmcnt(0) MUST be inside the same asm: the loads write
+    // the sink asynchronously and the compiler may reuse v140-143 right after an asm statement ends.
+    asm volatile(
+        "buffer_load_dwordx4 v[140:143], %0, %4, 0 offen\n\t"
+        "buffer_load_dwordx4 v[140:143], %1, %4, 0 offen\n\t"
+        "buffer_load_dwordx4 v[140:143], %2, %4, 0 offen\n\t"
+        "buffer_load_dwordx4 v[140:143], %3, %4, 0 offen\n\t"
+        "s_waitcnt vmcnt(0)"
+        :
+        : "v"(off[0]), "v"(off[1]), "v"(off[2]), "v"(off[3]), "s"(v_buffer)
+        : "v140", "v141", "v142", "v143", "memory");
   };
 
   auto softmax = [&](fp32x4_t scores[QTilesPerWave][KvSubtiles],
@@ -1028,6 +1033,10 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
   int kv_block = first_blk;       // current processed block
   bool has_work = has_any_block;
 
+  // One loop copy per group (g is constant after unroll), so neither copy keeps the other group's state live.
+#pragma unroll
+  for (int g = 0; g < 2; ++g) {
+  if ((g == 0) != group_a) continue;
   while (has_work) {
     // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
     // ended its RLE range" → record's flush.
@@ -1043,7 +1052,7 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     const bool block_closed_range = isLite ? !range_cont : false;
     const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
     const bool first = (step == 0);
-    if (group_a) {  // P1
+    if (g == 0) {  // P1
       if (!first) pv_phase(prev_block, probs, step - 1);
       qk_phase(k_buf_cur, scores);
     } else {
@@ -1051,7 +1060,7 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
       if (has_next) direct_lds_k(next_block, k_buf_next);
     }
     __builtin_amdgcn_s_barrier();
-    if (group_a) {  // P2
+    if (g == 0) {  // P2
       softmax(scores, probs, step, kv_block);
       // tid 0 folds prev_block's skip verdict into the write-list RLE. Safe: vote stored to sverdict last iter
       // (VerdictRing depth 2 keeps it live).
@@ -1072,6 +1081,7 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(
     prev_ended_range = block_closed_range;
     kv_block = next_block;
     has_work = has_next;
+  }
   }
   // Epilogue. The loop defers each block's pv (and B's softmax) by one iter, so prev_block is still pending: B owes a
   // softmax (A did its at P2), both owe the final pv. Lite then flushes the last block's range-end vote + RLE length.
