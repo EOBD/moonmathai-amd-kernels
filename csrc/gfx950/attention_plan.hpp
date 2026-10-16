@@ -667,7 +667,8 @@ inline Plan dev_plan(Problem p, int n, int mq, int mk, int total_q, int total_k,
     // 2. Wave rows and P: fastest modelled time; a later candidate must win by SplitMinGain.
     int rows = MaxWaveRows, parts = 1;
     double best = 1e300;
-    for (int P = 1; P <= MaxParts && max_blocks(MaxWaveRows) * packs <= SplitMaxRounds * n_cu; ++P)
+    const bool can_split = max_blocks(MaxWaveRows) * packs <= SplitMaxRounds * n_cu;
+    for (int P = 1; P <= (can_split ? MaxParts : 1); ++P)
         for (int r : {MaxWaveRows, 32}) {
             if (P > 1 && max_blocks(r) * packs * P > DevSplitRounds * n_cu) continue;
             p.rows = r;
