@@ -55,7 +55,7 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
     const int lane = tid & 63;
     const int col = lane & 15;  // q-col / kv-row within a 16-wide tile
     const int quad = lane >> 4; // which group of 4 lanes (0..3)
-    const bool group_a = (wave_id < LoadWaves);
+    const bool group_a = (int)to_scalar((uint32_t)wave_id) < LoadWaves; // SGPR → scalar branches
     const int wave_in_group = group_a ? wave_id : (wave_id - LoadWaves);
 
     // K-LDS XOR swizzle (stride-64, bank-conflict-free), matches direct_lds_k's HBM-source swizzle. Read-offset fields
@@ -506,14 +506,22 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
     auto prefetch_v_t_l1 = [&](int kv_iter_next) {
         if (kv_iter_next < 0)
             return;
+        static_assert(VtChunks / LoadWaves == 4, "prefetch asm below issues exactly 4 loads");
+        uint32_t off[4];
         #pragma unroll
-        for (int i = 0; i < VtChunks / LoadWaves; ++i) {
-            const int chunk = VtPrefetch(wave_in_group, i);
-            const uint32_t chunk_off = (uint32_t)(VtLayout(kv_iter_next, chunk, lane) * 2);
-            // v[140:143] = discard sink (L1-fill side effect only; data never read). A fixed GPR keeps it out of the
-            // allocator's live set.
-            asm volatile("buffer_load_dwordx4 v[140:143], %0, %1, 0 offen" : : "v"(chunk_off), "s"(v_buffer) : "v140", "v141", "v142", "v143", "memory");
-        }
+        for (int i = 0; i < 4; ++i)
+            off[i] = (uint32_t)(VtLayout(kv_iter_next, VtPrefetch(wave_in_group, i), lane) * 2);
+        // v[140:143] = discard sink (L1-fill side effect only). The vmcnt(0) MUST be inside the same asm: the loads write
+        // the sink asynchronously and the compiler may reuse v140-143 right after an asm statement ends.
+        asm volatile(
+            "buffer_load_dwordx4 v[140:143], %0, %4, 0 offen\n\t"
+            "buffer_load_dwordx4 v[140:143], %1, %4, 0 offen\n\t"
+            "buffer_load_dwordx4 v[140:143], %2, %4, 0 offen\n\t"
+            "buffer_load_dwordx4 v[140:143], %3, %4, 0 offen\n\t"
+            "s_waitcnt vmcnt(0)"
+            :
+            : "v"(off[0]), "v"(off[1]), "v"(off[2]), "v"(off[3]), "s"(v_buffer)
+            : "v140", "v141", "v142", "v143", "memory");
     };
 
     auto softmax = [&](fp32x4_t scores[QTilesPerWave][KvSubtiles], bf16x4_t probs[QTilesPerWave][KvSubtiles], int step, int kv_block) {
@@ -588,23 +596,22 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
     int prev_block = -1, step = 0; // step counts PROCESSED blocks (drives K double-buffer parity)
     int kv_block = first_blk;      // current processed block
     bool has_work = has_any_block;
-    u32x4_t a_v_ring[PvDepth];
-    if (group_a) {
-        if (!has_work) return;
-        {
-            // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
-            // ended its RLE range" → record's flush.
-            int next_block;
-            bool has_next;
-            if constexpr (isLite) {
-                next_block = advance(kv_block, kv_stride);
-                has_next = (next_block >= 0);
-            } else {
-                next_block = kv_block + kv_stride;
-                has_next = (next_block < num_kv_blocks);
-            }
-            const bool block_closed_range = isLite ? !range_cont : false;
-            const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
+    if (!has_work) return;
+    {
+        // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
+        // ended its RLE range" → record's flush.
+        int next_block;
+        bool has_next;
+        if constexpr (isLite) {
+            next_block = advance(kv_block, kv_stride);
+            has_next = (next_block >= 0);
+        } else {
+            next_block = kv_block + kv_stride;
+            has_next = (next_block < num_kv_blocks);
+        }
+        const bool block_closed_range = isLite ? !range_cont : false;
+        const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
+        if (group_a) { // P1
             qk_phase(k_buf_cur, scores);
 
             __builtin_amdgcn_s_barrier();
@@ -612,36 +619,44 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
             softmax(scores, probs, step, kv_block);
             // tid 0 folds prev_block's skip verdict into the write-list RLE. Safe: vote stored to sverdict last iter
             // (VerdictRing depth 2 keeps it live).
-            if (has_next) {
+            if (has_next)
                 prefetch_v_t_l1(kv_block);
-                pv_phase_preload(kv_block, probs, step - 1 + 1, a_v_ring);
-            }
-        
-            // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
-            // qk can't read stale K; lds_barrier covers LGKMCNT.
-            wait_vmcnt0();
-            lds_barrier();
-            prev_block = kv_block;
-            ++step;
-            prev_ended_range = block_closed_range;
-            kv_block = next_block;
-            has_work = has_next;
+        } else {
+            if (has_next)
+                direct_lds_k(next_block, k_buf_next);
+
+            __builtin_amdgcn_s_barrier();
+
+            qk_phase(k_buf_cur, scores);
         }
-        while (has_work) {
-            // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
-            // ended its RLE range" → record's flush.
-            int next_block;
-            bool has_next;
-            if constexpr (isLite) {
-                next_block = advance(kv_block, kv_stride);
-                has_next = (next_block >= 0);
-            } else {
-                next_block = kv_block + kv_stride;
-                has_next = (next_block < num_kv_blocks);
-            }
-            const bool block_closed_range = isLite ? !range_cont : false;
-            const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
-            pv_phase_compute(prev_block, probs, step - 1, a_v_ring);
+        // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
+        // qk can't read stale K; lds_barrier covers LGKMCNT.
+        wait_vmcnt0();
+        lds_barrier();
+        prev_block = kv_block;
+        ++step;
+        prev_ended_range = block_closed_range;
+        kv_block = next_block;
+        has_work = has_next;
+    }
+    while (has_work) {
+        // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
+        // ended its RLE range" → record's flush.
+        int next_block;
+        bool has_next;
+        if constexpr (isLite) {
+            next_block = advance(kv_block, kv_stride);
+            has_next = (next_block >= 0);
+        } else {
+            next_block = kv_block + kv_stride;
+            has_next = (next_block < num_kv_blocks);
+        }
+        const bool block_closed_range = isLite ? !range_cont : false;
+        const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
+        if (group_a) { // P1
+            u32x4_t v_ring[PvDepth];
+            pv_phase_preload(prev_block, probs, step - 1, v_ring);
+            pv_phase_compute(prev_block, probs, step - 1, v_ring);
             qk_phase(k_buf_cur, scores);
 
             __builtin_amdgcn_s_barrier();
@@ -653,200 +668,86 @@ __global__ __launch_bounds__(BlockSize, 1) void attention_forward(const bf16_t *
                 if (tid == 0)
                     record(prev_block, step - 1, prev_ended_range);
             }
-            if (has_next) {
+            if (has_next)
                 prefetch_v_t_l1(kv_block);
-                pv_phase_preload(kv_block, probs, step - 1 + 1, a_v_ring);
-            }
+        } else {
+            softmax(scores, probs, step - 1, prev_block);
+            if (has_next)
+                direct_lds_k(next_block, k_buf_next);
             
-            // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
-            // qk can't read stale K; lds_barrier covers LGKMCNT.
-            wait_vmcnt0();
-            lds_barrier();
-            prev_block = kv_block;
-            ++step;
-            prev_ended_range = block_closed_range;
-            kv_block = next_block;
-            has_work = has_next;
-        }
-        // Epilogue. The loop defers each block's pv (and B's softmax) by one iter, so prev_block is still pending: B owes a
-        if (step > 0) {
             u32x4_t v_ring[PvDepth];
             pv_phase_preload(prev_block, probs, step - 1, v_ring);
-            pv_phase_compute(prev_block, probs, step - 1, v_ring);
-        }
-        if constexpr (isLite) {
-            lds_barrier(); // group B's last-block vote → visible to tid 0
-            if (tid == 0 && step > 0) {
-                record(prev_block, step - 1, /*is_range_end=*/true); // finalize inline RLE
-                write_list[lbase] = (int16_t)(write_idx - 1);        // RLE length
-            }
-        }
 
-        // ─── Output ────────────────────────────────────────────────────────────
-        // row_sum summed across the 4 quad-lanes once here (math-equiv, rescale is row-global). inv_sum=0 when row_sum==0
-        // prevents 0×inf=NaN.
-        #pragma unroll
-        for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
-            row_sum[q_group] = cross_lane_sum(row_sum[q_group]);
-        if constexpr (Split) {
-            // A split part exports raw fp32 partials (o, plus row max `m` and sum `l`), UNSCALED — o/l division + bf16 pack are
-            // merge_parts' job. One CTA == one part.
-            TailScratch parts(part_buf);
-            const int part = blockIdx.x;
-            #pragma unroll
-            for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
-                // Absolute row of this (wave, q_group, lane) within the part's 384 rows.
-                const int row = (wave_id * QTilesPerWave + q_group) * QTileRows + col;
-                #pragma unroll
-                for (int t = 0; t < HeadDimTiles; ++t) // store each head-dim fragment (4 fp32) of the o accumulator
-                    *reinterpret_cast<fp32x4_t *>(&parts.o[PartO(part, row, HdFrag(t, quad))]) = o_acc[q_group][t];
-                if (quad == 0) {                                        // m and l are per-row scalars — only the first quad-lane of the row writes them
-                    parts.ml[PartMl(part, row)] = row_max[q_group];     // m = running softmax max
-                    parts.ml[PartMl(part, row) + 1] = row_sum[q_group]; // l = running softmax denominator
-                }
-            }
-            return;
+            __builtin_amdgcn_s_barrier();
+
+            pv_phase_compute(prev_block, probs, step - 1, v_ring);
+            qk_phase(k_buf_cur, scores);
         }
-        #pragma unroll
-        for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
-            if (!valid[q_group])
-                continue;
-            const float inv_sum = (row_sum[q_group] == 0.0f) ? 0.0f : fast_rcp(row_sum[q_group]);
-            // No PV mfma follows → packed v_pk_mul_f32 is safe. MaybeNaN pack4 scrubs residual NaN/Inf in o_acc from
-            // pathological inputs.
-            #pragma unroll
-            for (int t = 0; t < HeadDimTiles; ++t) {
-                o_acc[q_group][t] = o_acc[q_group][t] * inv_sum;
-                const bf16x4_t out = pack4_bf16</*MaybeNaN=*/true>(o_acc[q_group][t][0], o_acc[q_group][t][1], o_acc[q_group][t][2], o_acc[q_group][t][3]);
-                store_bf16x4(out_buffer, QOLayout(q_tile_start_row[q_group] + col, HdFrag(t, quad)) * 2, out);
-            }
+        // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
+        // qk can't read stale K; lds_barrier covers LGKMCNT.
+        wait_vmcnt0();
+        lds_barrier();
+        prev_block = kv_block;
+        ++step;
+        prev_ended_range = block_closed_range;
+        kv_block = next_block;
+        has_work = has_next;
+    }
+    // Epilogue. The loop defers each block's pv (and B's softmax) by one iter, so prev_block is still pending: B owes a
+    // softmax (A did its at P2), both owe the final pv. Lite then flushes the last block's range-end vote + RLE length.
+    if (!group_a && step > 0)
+        softmax(scores, probs, step - 1, prev_block);
+    if (step > 0) {
+        u32x4_t v_ring[PvDepth];
+        pv_phase_preload(prev_block, probs, step - 1, v_ring);
+        pv_phase_compute(prev_block, probs, step - 1, v_ring);
+    }
+    if constexpr (isLite) {
+        lds_barrier(); // group B's last-block vote → visible to tid 0
+        if (tid == 0 && step > 0) {
+            record(prev_block, step - 1, /*is_range_end=*/true); // finalize inline RLE
+            write_list[lbase] = (int16_t)(write_idx - 1);        // RLE length
         }
     }
-    else{
-        if (!has_work) return;
-            {
-                // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
-                // ended its RLE range" → record's flush.
-                int next_block;
-                bool has_next;
-                if constexpr (isLite) {
-                    next_block = advance(kv_block, kv_stride);
-                    has_next = (next_block >= 0);
-                } else {
-                    next_block = kv_block + kv_stride;
-                    has_next = (next_block < num_kv_blocks);
-                }
-                const bool block_closed_range = isLite ? !range_cont : false;
-                const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
-                if (has_next)
-                    direct_lds_k(next_block, k_buf_next);
 
-                __builtin_amdgcn_s_barrier();
-
-                qk_phase(k_buf_cur, scores);
-                
-                // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
-                // qk can't read stale K; lds_barrier covers LGKMCNT.
-                wait_vmcnt0();
-                lds_barrier();
-                prev_block = kv_block;
-                ++step;
-                prev_ended_range = block_closed_range;
-                kv_block = next_block;
-                has_work = has_next;
-            }
-            while (has_work) {
-                // Next processed block: lite cursor (every kv_stride-th KEPT block) or dense stride. block_closed_range = "kv_block
-                // ended its RLE range" → record's flush.
-                int next_block;
-                bool has_next;
-                if constexpr (isLite) {
-                    next_block = advance(kv_block, kv_stride);
-                    has_next = (next_block >= 0);
-                } else {
-                    next_block = kv_block + kv_stride;
-                    has_next = (next_block < num_kv_blocks);
-                }
-                const bool block_closed_range = isLite ? !range_cont : false;
-                const int k_buf_cur = step & 1, k_buf_next = (step + 1) & 1;
-                softmax(scores, probs, step - 1, prev_block);
-                if (has_next)
-                    direct_lds_k(next_block, k_buf_next);
-                
-                u32x4_t v_ring[PvDepth];
-                pv_phase_preload(prev_block, probs, step - 1, v_ring);
-
-                __builtin_amdgcn_s_barrier();
-
-                pv_phase_compute(prev_block, probs, step - 1, v_ring);
-                qk_phase(k_buf_cur, scores);
-            
-            // End-of-iter barrier: vmcnt(0) drains direct_lds_k writes (buffer_load…lds is VMCNT-tracked, not LGKMCNT) so next
-                // qk can't read stale K; lds_barrier covers LGKMCNT.
-                wait_vmcnt0();
-                lds_barrier();
-                prev_block = kv_block;
-                ++step;
-                prev_ended_range = block_closed_range;
-                kv_block = next_block;
-                has_work = has_next;
-            }
-            // Epilogue. The loop defers each block's pv (and B's softmax) by one iter, so prev_block is still pending: B owes a
-            // softmax (A did its at P2), both owe the final pv. Lite then flushes the last block's range-end vote + RLE length.
-            if ( step > 0)
-                softmax(scores, probs, step - 1, prev_block);
-            if (step > 0) {
-                u32x4_t v_ring[PvDepth];
-                pv_phase_preload(prev_block, probs, step - 1, v_ring);
-                pv_phase_compute(prev_block, probs, step - 1, v_ring);
-            }
-            if constexpr (isLite) {
-                lds_barrier(); // group B's last-block vote → visible to tid 0
-                if (tid == 0 && step > 0) {
-                    record(prev_block, step - 1, /*is_range_end=*/true); // finalize inline RLE
-                    write_list[lbase] = (int16_t)(write_idx - 1);        // RLE length
-                }
-            }
-
-            // ─── Output ────────────────────────────────────────────────────────────
-            // row_sum summed across the 4 quad-lanes once here (math-equiv, rescale is row-global). inv_sum=0 when row_sum==0
-            // prevents 0×inf=NaN.
+    // ─── Output ────────────────────────────────────────────────────────────
+    // row_sum summed across the 4 quad-lanes once here (math-equiv, rescale is row-global). inv_sum=0 when row_sum==0
+    // prevents 0×inf=NaN.
+    #pragma unroll
+    for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
+        row_sum[q_group] = cross_lane_sum(row_sum[q_group]);
+    if constexpr (Split) {
+        // A split part exports raw fp32 partials (o, plus row max `m` and sum `l`), UNSCALED — o/l division + bf16 pack are
+        // merge_parts' job. One CTA == one part.
+        TailScratch parts(part_buf);
+        const int part = blockIdx.x;
+        #pragma unroll
+        for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
+            // Absolute row of this (wave, q_group, lane) within the part's 384 rows.
+            const int row = (wave_id * QTilesPerWave + q_group) * QTileRows + col;
             #pragma unroll
-            for (int q_group = 0; q_group < QTilesPerWave; ++q_group)
-                row_sum[q_group] = cross_lane_sum(row_sum[q_group]);
-            if constexpr (Split) {
-                // A split part exports raw fp32 partials (o, plus row max `m` and sum `l`), UNSCALED — o/l division + bf16 pack are
-                // merge_parts' job. One CTA == one part.
-                TailScratch parts(part_buf);
-                const int part = blockIdx.x;
-                #pragma unroll
-                for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
-                    // Absolute row of this (wave, q_group, lane) within the part's 384 rows.
-                    const int row = (wave_id * QTilesPerWave + q_group) * QTileRows + col;
-                    #pragma unroll
-                    for (int t = 0; t < HeadDimTiles; ++t) // store each head-dim fragment (4 fp32) of the o accumulator
-                        *reinterpret_cast<fp32x4_t *>(&parts.o[PartO(part, row, HdFrag(t, quad))]) = o_acc[q_group][t];
-                    if (quad == 0) {                                        // m and l are per-row scalars — only the first quad-lane of the row writes them
-                        parts.ml[PartMl(part, row)] = row_max[q_group];     // m = running softmax max
-                        parts.ml[PartMl(part, row) + 1] = row_sum[q_group]; // l = running softmax denominator
-                    }
-                }
-                return;
+            for (int t = 0; t < HeadDimTiles; ++t) // store each head-dim fragment (4 fp32) of the o accumulator
+                *reinterpret_cast<fp32x4_t *>(&parts.o[PartO(part, row, HdFrag(t, quad))]) = o_acc[q_group][t];
+            if (quad == 0) {                                        // m and l are per-row scalars — only the first quad-lane of the row writes them
+                parts.ml[PartMl(part, row)] = row_max[q_group];     // m = running softmax max
+                parts.ml[PartMl(part, row) + 1] = row_sum[q_group]; // l = running softmax denominator
             }
-            #pragma unroll
-            for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
-                if (!valid[q_group])
-                    continue;
-                const float inv_sum = (row_sum[q_group] == 0.0f) ? 0.0f : fast_rcp(row_sum[q_group]);
-                // No PV mfma follows → packed v_pk_mul_f32 is safe. MaybeNaN pack4 scrubs residual NaN/Inf in o_acc from
-                // pathological inputs.
-                #pragma unroll
-                for (int t = 0; t < HeadDimTiles; ++t) {
-                    o_acc[q_group][t] = o_acc[q_group][t] * inv_sum;
-                    const bf16x4_t out = pack4_bf16</*MaybeNaN=*/true>(o_acc[q_group][t][0], o_acc[q_group][t][1], o_acc[q_group][t][2], o_acc[q_group][t][3]);
-                    store_bf16x4(out_buffer, QOLayout(q_tile_start_row[q_group] + col, HdFrag(t, quad)) * 2, out);
-                }
-            }
+        }
+        return;
+    }
+    #pragma unroll
+    for (int q_group = 0; q_group < QTilesPerWave; ++q_group) {
+        if (!valid[q_group])
+            continue;
+        const float inv_sum = (row_sum[q_group] == 0.0f) ? 0.0f : fast_rcp(row_sum[q_group]);
+        // No PV mfma follows → packed v_pk_mul_f32 is safe. MaybeNaN pack4 scrubs residual NaN/Inf in o_acc from
+        // pathological inputs.
+        #pragma unroll
+        for (int t = 0; t < HeadDimTiles; ++t) {
+            o_acc[q_group][t] = o_acc[q_group][t] * inv_sum;
+            const bf16x4_t out = pack4_bf16</*MaybeNaN=*/true>(o_acc[q_group][t][0], o_acc[q_group][t][1], o_acc[q_group][t][2], o_acc[q_group][t][3]);
+            store_bf16x4(out_buffer, QOLayout(q_tile_start_row[q_group] + col, HdFrag(t, quad)) * 2, out);
+        }
     }
 }
 

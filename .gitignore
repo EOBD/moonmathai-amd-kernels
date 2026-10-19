@@ -34,3 +34,4 @@ rocprof_out/
 
 # Local scratch
 temp/
+**/kernel_test_results/**
